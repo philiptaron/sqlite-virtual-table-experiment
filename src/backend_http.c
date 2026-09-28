@@ -3,12 +3,13 @@
  * over HTTP (backend='http://host:port'). Every request is a JSON POST:
  *
  *   /v1/query   {"table": T, "col": C, "op": "eq"|"ge"|"gt"|null, "arg": V,
- *                "order": bool, "limit": N|null}
- *               -> {"rows": [[...], ...]}
+ *                "order": bool, "limit": N|null, "prefetch": N|null}
+ *               -> {"rows": [[...], ...], "epoch": E,
+ *                   "prefetch": {"paths": [...], "refs": [...], "outputs": [...]}}
  *   /v1/commit  {"ops": [{"op": "insert", "table": T, "cols": [...]},
  *                        {"op": "update", "table": T, "id": N, "cols": [...]},
  *                        {"op": "delete", "table": T, "id": N}]}
- *               -> {}
+ *               -> {"epoch": E}
  *
  * Failures are {"error": "..."} with status 409 when another host changed
  * something the transaction relied on (SQLITE_BUSY, so Nix retries the
@@ -22,27 +23,51 @@
  * has just registered; any other read after a write in one transaction is
  * refused, as Nix never makes one.
  *
+ * Reads are cached, but only facts that stay true for as long as a path is
+ * valid: its ValidPaths row, its references (Refs by referrer), and its
+ * derivation outputs (DerivationOutputs by drv). Absence is never cached,
+ * nor are referrers or derivers, which other hosts add to at any time. A
+ * ValidPaths lookup prefetches up to `prefetch` paths of the closure, each
+ * with its references and outputs, which is what Nix goes on to ask for.
+ * The cache is dropped when a response carries a new epoch (a commit
+ * somewhere deleted or changed a path), when a commit conflicts, and entry
+ * by entry after `cache_ttl` seconds; it also lives no longer than the
+ * database connection, which is one Nix process or daemon session. Both
+ * are URL parameters: http://host:port?cache_ttl=60&prefetch=500, where
+ * cache_ttl=0 turns caching off.
+ *
  * JSON is parsed and quoted by SQLite's JSON functions, run on a private
- * in-memory database that also holds the pending ValidPaths rows.
+ * in-memory database that also holds the pending writes and the cache.
  */
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT3
 
 #include <curl/curl.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "backend.h"
 
 #define FIRST_PAGE 16
 #define MAX_PAGE 4096
 
+#define VP_COLS "id, path, hash, registrationTime, deriver, narSize, ultimate, sigs, ca"
+#define VP_FROM_JSON                                                              \
+  "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), " \
+  "json_extract(value, '$[3]'), json_extract(value, '$[4]'), json_extract(value, '$[5]'), " \
+  "json_extract(value, '$[6]'), json_extract(value, '$[7]'), json_extract(value, '$[8]')"
+
 typedef struct {
   nr_backend base;
-  char *url;                  /* without a trailing slash */
+  char *url;                  /* without a trailing slash or parameters */
   CURL *curl;
   struct curl_slist *headers;
   sqlite3 *mem;
   sqlite3_stmt *quote;        /* select json_quote(?1) */
+  int cache_ttl;              /* seconds; 0 disables the cache */
+  int prefetch;               /* most paths one lookup brings into the cache */
+  sqlite3_int64 epoch;        /* of the cache's contents */
   int in_txn;
   sqlite3_str *ops;           /* the pending commit's ops, comma separated */
   int nops;
@@ -53,7 +78,7 @@ typedef struct {
 
 typedef struct {
   nr_rows base;
-  sqlite3_stmt *stmt;         /* on mem: over pending rows, or json_each over a response */
+  sqlite3_stmt *stmt;         /* on mem: over pending or cached rows, or json_each over a response */
   /* Paging through a scan ordered by column col (col < 0: not paging). */
   const struct nr_table *table;
   int col;
@@ -63,9 +88,16 @@ typedef struct {
 } http_rows;
 
 static const char mem_schema[] =
+  /* This transaction's ValidPaths writes, and its deletions. */
   "create table pending (id integer primary key, path text unique, hash, registrationTime,"
   "  deriver, narSize, ultimate, sigs, ca);"
-  "create table deleted (id integer primary key);";
+  "create table deleted (id integer primary key);"
+  /* The cache. A path's references and outputs are cached exactly when
+     its row is, and are complete. */
+  "create table cache_paths (id integer primary key, path text unique, hash, registrationTime,"
+  "  deriver, narSize, ultimate, sigs, ca, fetched integer not null);"
+  "create table cache_refs (referrer, reference, primary key (referrer, reference));"
+  "create table cache_outputs (drv, id, path, primary key (drv, id));";
 
 static unsigned table_bit(const struct nr_table *t) {
   for (int i = 0; i < 3; i++)
@@ -76,6 +108,56 @@ static unsigned table_bit(const struct nr_table *t) {
 
 static int mem_fail(http_backend *h, int rc) {
   return nr_fail(&h->base, rc, "%s", sqlite3_errmsg(h->mem));
+}
+
+/* Prepare sql on mem with ?1 bound to v1 (if given) and ?2 to v2 (if used). */
+static int mem_prepare(http_backend *h, const char *sql, sqlite3_value *v1, sqlite3_int64 v2,
+                       sqlite3_stmt **stmt) {
+  int rc = sqlite3_prepare_v2(h->mem, sql, -1, stmt, NULL);
+  if (rc != SQLITE_OK)
+    return mem_fail(h, rc);
+  if (v1)
+    sqlite3_bind_value(*stmt, 1, v1);
+  if (sqlite3_bind_parameter_count(*stmt) >= 2)
+    sqlite3_bind_int64(*stmt, 2, v2);
+  return SQLITE_OK;
+}
+
+static int mem_exists(http_backend *h, const char *sql, sqlite3_value *v1, sqlite3_int64 v2) {
+  sqlite3_stmt *stmt;
+  int found = 0;
+  if (mem_prepare(h, sql, v1, v2, &stmt) == SQLITE_OK) {
+    found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+  }
+  return found;
+}
+
+static int mem_exec(http_backend *h, const char *sql, sqlite3_value *v1, sqlite3_int64 v2) {
+  sqlite3_stmt *stmt;
+  int rc = mem_prepare(h, sql, v1, v2, &stmt);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  return rc == SQLITE_DONE ? SQLITE_OK : mem_fail(h, rc);
+}
+
+/* Run sql on mem with ?1 bound to text, for statements reading a response. */
+static int mem_exec_text(http_backend *h, const char *sql, const char *text, sqlite3_int64 v2) {
+  sqlite3_stmt *stmt;
+  int rc = mem_prepare(h, sql, NULL, v2, &stmt);
+  if (rc != SQLITE_OK)
+    return rc;
+  sqlite3_bind_text(stmt, 1, text, -1, SQLITE_STATIC);
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  return rc == SQLITE_DONE || rc == SQLITE_ROW ? SQLITE_OK : mem_fail(h, rc);
+}
+
+static void flush_cache(http_backend *h) {
+  sqlite3_exec(h->mem, "delete from cache_paths; delete from cache_refs; delete from cache_outputs;",
+               NULL, NULL, NULL);
 }
 
 /* Append v (or, if v is NULL, text) to s as a JSON literal. */
@@ -100,6 +182,46 @@ static void append_cols(http_backend *h, sqlite3_str *s, const struct nr_table *
     append_json(h, s, cols[i], NULL);
   }
   sqlite3_str_appendall(s, "]");
+}
+
+/*
+ * Take in what a successful response says besides its answer: the epoch,
+ * which drops the cache if it moved, and any prefetched paths.
+ */
+static int absorb(http_backend *h, const char *response) {
+  sqlite3_stmt *stmt;
+  int rc = mem_prepare(h, "select json_extract(?1, '$.epoch')", NULL, 0, &stmt);
+  if (rc != SQLITE_OK)
+    return rc;
+  sqlite3_bind_text(stmt, 1, response, -1, SQLITE_STATIC);
+  if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_INTEGER) {
+    sqlite3_int64 epoch = sqlite3_column_int64(stmt, 0);
+    if (epoch != h->epoch) {
+      flush_cache(h);
+      h->epoch = epoch;
+    }
+  }
+  sqlite3_finalize(stmt);
+  if (h->cache_ttl <= 0)
+    return SQLITE_OK;
+
+  sqlite3_int64 now = time(NULL);
+  if ((rc = mem_exec_text(h,
+                          "insert or replace into cache_paths (" VP_COLS ", fetched)"
+                          " select " VP_FROM_JSON ", ?2 from json_each(?1, '$.prefetch.paths')",
+                          response, now)) != SQLITE_OK ||
+      (rc = mem_exec_text(h,
+                          "insert or ignore into cache_refs"
+                          " select json_extract(value, '$[0]'), json_extract(value, '$[1]')"
+                          " from json_each(?1, '$.prefetch.refs')",
+                          response, 0)) != SQLITE_OK ||
+      (rc = mem_exec_text(h,
+                          "insert or ignore into cache_outputs"
+                          " select json_extract(value, '$[0]'), json_extract(value, '$[1]'),"
+                          " json_extract(value, '$[2]') from json_each(?1, '$.prefetch.outputs')",
+                          response, 0)) != SQLITE_OK)
+    return rc;
+  return SQLITE_OK;
 }
 
 static size_t on_body(char *data, size_t size, size_t n, void *userdata) {
@@ -139,14 +261,21 @@ static int post(http_backend *h, const char *path, char *body, char **response) 
   if (cc != CURLE_OK) {
     rc = nr_fail(&h->base, SQLITE_IOERR, "%s: %s", url, curl_easy_strerror(cc));
   } else if (status != 200) {
+    /* A conflict means some of what we believed is out of date. */
+    if (status == 409)
+      flush_cache(h);
     char *msg = error_message(h, text);
     rc = nr_fail(&h->base, status == 409 ? SQLITE_BUSY : status == 422 ? SQLITE_CONSTRAINT : SQLITE_ERROR,
                  "%s (HTTP %ld from %s)", msg, status, url);
     sqlite3_free(msg);
+  } else {
+    if (!text)
+      text = sqlite3_mprintf("{}");
+    rc = absorb(h, text);
   }
   sqlite3_free(url);
   if (rc == SQLITE_OK)
-    *response = text ? text : sqlite3_mprintf("{}");
+    *response = text;
   else
     sqlite3_free(text);
   return rc;
@@ -154,7 +283,7 @@ static int post(http_backend *h, const char *path, char *body, char **response) 
 
 /* Replace rows->stmt with one over the rows of a /v1/query response. */
 static int fetch(http_backend *h, http_rows *rows, const char *op, int col, sqlite3_value *arg,
-                 const char *arg_text, int order, int limit) {
+                 const char *arg_text, int order, int limit, int prefetch) {
   const struct nr_table *t = rows->table;
   sqlite3_str *req = sqlite3_str_new(NULL);
   sqlite3_str_appendf(req, "{\"table\":\"%s\",\"col\":", t->name);
@@ -169,6 +298,8 @@ static int fetch(http_backend *h, http_rows *rows, const char *op, int col, sqli
   sqlite3_str_appendf(req, ",\"order\":%s", order ? "true" : "false");
   if (limit)
     sqlite3_str_appendf(req, ",\"limit\":%d", limit);
+  if (prefetch)
+    sqlite3_str_appendf(req, ",\"prefetch\":%d", prefetch);
   sqlite3_str_appendall(req, "}");
 
   char *response;
@@ -207,40 +338,6 @@ static int new_rows(http_backend *h, const struct nr_table *t, http_rows **out) 
   return SQLITE_OK;
 }
 
-/* Rows of the transaction's own ValidPaths writes where cols[col] = arg. */
-static int pending_rows(http_backend *h, int col, sqlite3_value *arg, http_rows *rows) {
-  sqlite3_str *sql = sqlite3_str_new(NULL);
-  sqlite3_str_appendall(sql, "select ");
-  for (int i = 0; i < nr_valid_paths.ncols; i++)
-    sqlite3_str_appendf(sql, "%s%s", i ? ", " : "", nr_valid_paths.cols[i]);
-  if (col >= 0)
-    sqlite3_str_appendf(sql, " from pending where %s = ?1", nr_valid_paths.cols[col]);
-  else
-    sqlite3_str_appendall(sql, " from pending where 0");
-  char *text = sqlite3_str_finish(sql);
-  int rc = sqlite3_prepare_v2(h->mem, text, -1, &rows->stmt, NULL);
-  sqlite3_free(text);
-  if (rc != SQLITE_OK)
-    return mem_fail(h, rc);
-  if (col >= 0)
-    sqlite3_bind_value(rows->stmt, 1, arg);
-  return SQLITE_OK;
-}
-
-static int mem_exists(http_backend *h, const char *sql, sqlite3_value *arg, sqlite3_int64 id) {
-  sqlite3_stmt *stmt;
-  int found = 0;
-  if (sqlite3_prepare_v2(h->mem, sql, -1, &stmt, NULL) == SQLITE_OK) {
-    if (arg)
-      sqlite3_bind_value(stmt, 1, arg);
-    else
-      sqlite3_bind_int64(stmt, 1, id);
-    found = sqlite3_step(stmt) == SQLITE_ROW;
-    sqlite3_finalize(stmt);
-  }
-  return found;
-}
-
 /*
  * Serve an equality lookup on ValidPaths from the transaction's own writes
  * when it touches them: *served is set if rows now holds the answer (the
@@ -250,18 +347,45 @@ static int overlay(http_backend *h, int col, sqlite3_value *arg, http_rows *rows
   static const char *const has_pending[] = {
     "select 1 from pending where id = ?1", "select 1 from pending where path = ?1",
   };
+  static const char *const pending_rows[] = {
+    "select " VP_COLS " from pending where id = ?1", "select " VP_COLS " from pending where path = ?1",
+  };
   *served = 0;
   if (mem_exists(h, has_pending[col], arg, 0)) {
     *served = 1;
-    return pending_rows(h, col, arg, rows);
+    return mem_prepare(h, pending_rows[col], arg, 0, &rows->stmt);
   }
   sqlite3_int64 id = col == 0 ? sqlite3_value_int64(arg)
                               : nr_path_id((const char *)sqlite3_value_text(arg));
-  if (id >= 0 && mem_exists(h, "select 1 from deleted where id = ?1", NULL, id)) {
+  if (id >= 0 && mem_exists(h, "select 1 from deleted where id = ?2", NULL, id)) {
     *served = 1;
-    return pending_rows(h, -1, NULL, rows);
+    return mem_prepare(h, "select " VP_COLS " from pending where 0", NULL, 0, &rows->stmt);
   }
   return SQLITE_OK;
+}
+
+/* Serve an equality lookup from the cache if it holds the answer. */
+static int cached(http_backend *h, const struct nr_table *t, int col, sqlite3_value *arg,
+                  http_rows *rows, int *served) {
+  const char *known = NULL, *sql = NULL;
+  if (t == &nr_valid_paths && col == 0) {
+    known = "select 1 from cache_paths where id = ?1 and fetched > ?2";
+    sql = "select " VP_COLS " from cache_paths where id = ?1";
+  } else if (t == &nr_valid_paths && col == 1) {
+    known = "select 1 from cache_paths where path = ?1 and fetched > ?2";
+    sql = "select " VP_COLS " from cache_paths where path = ?1";
+  } else if (t == &nr_refs && col == 0) {
+    known = "select 1 from cache_paths where id = ?1 and fetched > ?2";
+    sql = "select referrer, reference from cache_refs where referrer = ?1";
+  } else if (t == &nr_derivation_outputs && col == 0) {
+    known = "select 1 from cache_paths where id = ?1 and fetched > ?2";
+    sql = "select drv, id, path from cache_outputs where drv = ?1";
+  }
+  *served = 0;
+  if (!known || !mem_exists(h, known, arg, (sqlite3_int64)time(NULL) - h->cache_ttl))
+    return SQLITE_OK;
+  *served = 1;
+  return mem_prepare(h, sql, arg, 0, &rows->stmt);
 }
 
 static int http_query(nr_backend *base, const struct nr_table *t, enum nr_op op, int col,
@@ -272,19 +396,21 @@ static int http_query(nr_backend *base, const struct nr_table *t, enum nr_op op,
   if (rc != SQLITE_OK)
     return rc;
 
+  int served = 0;
   if (h->in_txn && (h->written & table_bit(t) || h->deleted)) {
-    int served = 0;
     if (t == &nr_valid_paths && op == NR_EQ)
       rc = overlay(h, col, arg, rows, &served);
     else
       rc = nr_fail(base, SQLITE_ERROR, "reading %s after writing in the same transaction is not supported", t->name);
-    if (rc != SQLITE_OK || served) {
-      if (rc == SQLITE_OK)
-        *out = &rows->base;
-      else
-        nr_rows_close(&rows->base);
-      return rc;
-    }
+  }
+  if (rc == SQLITE_OK && !served && op == NR_EQ && h->cache_ttl > 0)
+    rc = cached(h, t, col, arg, rows, &served);
+  if (rc != SQLITE_OK || served) {
+    if (rc == SQLITE_OK)
+      *out = &rows->base;
+    else
+      nr_rows_close(&rows->base);
+    return rc;
   }
 
   int ordered = -1;
@@ -294,15 +420,16 @@ static int http_query(nr_backend *base, const struct nr_table *t, enum nr_op op,
       break;
     }
   if (op == NR_EQ) {
-    rc = fetch(h, rows, "eq", col, arg, NULL, 0, 0);
+    int prefetch = t == &nr_valid_paths && h->cache_ttl > 0 ? h->prefetch : 0;
+    rc = fetch(h, rows, "eq", col, arg, NULL, 0, 0, prefetch);
   } else if (op == NR_GE) {
     rows->col = col;
-    rc = fetch(h, rows, "ge", col, arg, NULL, 1, FIRST_PAGE);
+    rc = fetch(h, rows, "ge", col, arg, NULL, 1, FIRST_PAGE, 0);
   } else if (ordered >= 0) {
     rows->col = ordered;
-    rc = fetch(h, rows, NULL, ordered, NULL, NULL, 1, FIRST_PAGE);
+    rc = fetch(h, rows, NULL, ordered, NULL, NULL, 1, FIRST_PAGE, 0);
   } else {
-    rc = fetch(h, rows, NULL, -1, NULL, NULL, 0, 0);
+    rc = fetch(h, rows, NULL, -1, NULL, NULL, 0, 0, 0);
   }
   if (rc != SQLITE_OK) {
     nr_rows_close(&rows->base);
@@ -331,7 +458,7 @@ static int http_rows_next(nr_rows *base) {
       return SQLITE_DONE;
     /* A full page: ask for the rows after the last one seen. */
     int limit = rows->limit * 2 > MAX_PAGE ? MAX_PAGE : rows->limit * 2;
-    rc = fetch(h, rows, "gt", rows->col, NULL, rows->last, 1, limit);
+    rc = fetch(h, rows, "gt", rows->col, NULL, rows->last, 1, limit, 0);
     if (rc != SQLITE_OK)
       return rc;
   }
@@ -374,17 +501,6 @@ static int put_pending(http_backend *h, sqlite3_int64 id, sqlite3_value **cols) 
   return SQLITE_OK;
 }
 
-static int mem_exec_id(http_backend *h, const char *sql, sqlite3_int64 id) {
-  sqlite3_stmt *stmt;
-  int rc = sqlite3_prepare_v2(h->mem, sql, -1, &stmt, NULL);
-  if (rc != SQLITE_OK)
-    return mem_fail(h, rc);
-  sqlite3_bind_int64(stmt, 1, id);
-  rc = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-  return rc == SQLITE_DONE ? SQLITE_OK : mem_fail(h, rc);
-}
-
 static int require_txn(http_backend *h) {
   return h->in_txn ? SQLITE_OK : nr_fail(&h->base, SQLITE_MISUSE, "write outside a transaction");
 }
@@ -401,7 +517,7 @@ static int http_insert(nr_backend *base, const struct nr_table *t, sqlite3_value
     if (id < 0)
       return nr_fail(base, SQLITE_CONSTRAINT, "\"%s\" is not a store path", sqlite3_value_text(cols[1]));
     if ((rc = put_pending(h, id, cols)) != SQLITE_OK ||
-        (rc = mem_exec_id(h, "delete from deleted where id = ?1", id)) != SQLITE_OK)
+        (rc = mem_exec(h, "delete from deleted where id = ?2", NULL, id)) != SQLITE_OK)
       return rc;
   }
   sqlite3_str *s = add_op(h, "insert", t);
@@ -429,8 +545,8 @@ static int http_delete(nr_backend *base, const struct nr_table *t, sqlite3_int64
   http_backend *h = (http_backend *)base;
   int rc = require_txn(h);
   if (rc != SQLITE_OK ||
-      (rc = mem_exec_id(h, "delete from pending where id = ?1", rowid)) != SQLITE_OK ||
-      (rc = mem_exec_id(h, "insert or ignore into deleted values (?1)", rowid)) != SQLITE_OK)
+      (rc = mem_exec(h, "delete from pending where id = ?2", NULL, rowid)) != SQLITE_OK ||
+      (rc = mem_exec(h, "insert or ignore into deleted values (?2)", NULL, rowid)) != SQLITE_OK)
     return rc;
   sqlite3_str_appendf(add_op(h, "delete", t), ",\"id\":%lld}", rowid);
   h->deleted = 1;
@@ -511,18 +627,54 @@ static const struct nr_backend_ops http_ops = {
   .rollback = http_rollback,
 };
 
+/* Parse the URL's ?cache_ttl=N&prefetch=N into h. */
+static int parse_params(http_backend *h, const char *params, char **errmsg) {
+  while (params && *params) {
+    const char *end = strchr(params, '&');
+    size_t len = end ? (size_t)(end - params) : strlen(params);
+    char *param = sqlite3_mprintf("%.*s", (int)len, params);
+    char *eq = strchr(param, '=');
+    char *rest = NULL;
+    long value = eq ? strtol(eq + 1, &rest, 10) : -1;
+    int ok = eq && rest != eq + 1 && *rest == '\0' && value >= 0;
+    if (ok && strncmp(param, "cache_ttl=", 10) == 0)
+      h->cache_ttl = (int)value;
+    else if (ok && strncmp(param, "prefetch=", 9) == 0 && value > 0)
+      h->prefetch = (int)value;
+    else
+      ok = 0;
+    if (!ok)
+      *errmsg = sqlite3_mprintf("nixremote: bad backend URL parameter \"%s\"", param);
+    sqlite3_free(param);
+    if (!ok)
+      return SQLITE_ERROR;
+    params = end ? end + 1 : NULL;
+  }
+  return SQLITE_OK;
+}
+
 int nr_http_open(const char *uri, nr_backend **out, char **errmsg) {
   http_backend *h = sqlite3_malloc(sizeof *h);
   if (!h)
     return SQLITE_NOMEM;
   memset(h, 0, sizeof *h);
   h->base.ops = &http_ops;
-  size_t n = strlen(uri);
+  h->cache_ttl = 60;
+  h->prefetch = 500;
+  h->epoch = -1;
+
+  const char *params = strchr(uri, '?');
+  size_t n = params ? (size_t)(params - uri) : strlen(uri);
   while (n > 0 && uri[n - 1] == '/')
     n--;
   h->url = sqlite3_mprintf("%.*s", (int)n, uri);
+  int rc = parse_params(h, params ? params + 1 : NULL, errmsg);
+  if (rc != SQLITE_OK) {
+    http_close(&h->base);
+    return rc;
+  }
 
-  int rc = sqlite3_open_v2(":memory:", &h->mem, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+  rc = sqlite3_open_v2(":memory:", &h->mem, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
   if (rc == SQLITE_OK)
     rc = sqlite3_exec(h->mem, mem_schema, NULL, NULL, NULL);
   if (rc == SQLITE_OK)

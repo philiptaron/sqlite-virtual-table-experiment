@@ -172,6 +172,13 @@ if [[ $backend == http* ]]; then
     not_ok "registration after an injected conflict"
     sed 's/^/     /' "$work/retry.err"
   fi
+
+  echo "# caching, seen from one long-lived connection on host a"
+  rc=0
+  python3 test/cache.py "$lib" "$work/a/db/db.sqlite" "$backend" "$b" "$top" $(nix-store -q --references "$top") >"$work/cache.out" 2>&1 || rc=$?
+  cat "$work/cache.out"
+  failures=$((failures + $(grep -c '^FAIL' "$work/cache.out" || true)))
+  [[ $rc == 0 ]] || grep -q '^FAIL' "$work/cache.out" || not_ok "test/cache.py exited $rc"
 fi
 
 echo "# a path registered behind Nix's back reads as a retryable conflict"

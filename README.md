@@ -19,7 +19,8 @@ read and write goes to one metadata service that provides consistency.
   - `src/backend_http.c` (`http://`, `https://`) is the client for the
     metadata service. It holds a transaction's writes and sends them as one
     atomic commit. Reads inside the transaction see that transaction's own
-    `ValidPaths` writes.
+    `ValidPaths` writes. It caches only what stays true while a path is
+    valid (see below).
   - `src/backend_sqlite.c` (`file:`) opens a shared SQLite file directly,
     for experiments.
 - `server/nixremote-server`: a reference implementation of the metadata
@@ -40,6 +41,33 @@ buffered. When a transaction conflicts with another host's changes, the
 service answers 409. The host turns that into `SQLITE_BUSY`, Nix retries
 the transaction, and on the retry it re-checks what it relied on.
 
+## Caching
+
+A host caches a path's row, its references, and its derivation outputs,
+because those don't change while the path is valid. It never caches
+absence, referrers, or derivers: another host can add to those at any
+moment, and Nix re-checks validity after taking a lock, expecting a fresh
+answer. A lookup that misses the cache also brings back (prefetches) the
+path's closure, up to 500 paths breadth first, so walking a closure costs
+about one request.
+
+The cache is dropped when:
+
+- a response carries a new epoch, which the service bumps whenever a
+  commit deletes or changes a path;
+- a commit conflicts;
+- a single entry is older than 60 seconds;
+- the database connection closes, which happens at the end of every Nix
+  process and every daemon session.
+
+So a cached answer can be stale, but only until the host's next request
+that the cache can't answer. Staleness also can't cause a bad write,
+because the service checks every commit against its current state.
+
+Both settings are URL parameters, for example
+`http://host:port?cache_ttl=60&prefetch=500`. `cache_ttl=0` turns the cache
+off.
+
 ## Try it
 
 ```sh
@@ -58,12 +86,13 @@ NIX_CONFIG="plugin-files = $PWD/libnixremote.dylib" \
 `PATH`. Two simulated hosts share one store directory and one backend, and
 every query is compared with a plain store. With `http`, it also injects a
 commit conflict (`--test-hooks`) and checks that Nix retries through it.
+`test/cache.py` then checks the cache's request counts and invalidation
+from a single long-lived connection.
 
 ## Not yet
 
-- No caching. Every lookup is a round trip, and SQLite resolves Nix's
-  references join one row at a time: `nix path-info -r` on 3 paths makes
-  12 requests.
+- Registering paths still costs a few round trips per path, mostly Nix
+  asking whether each path is valid yet. Those answers can't be cached.
 - The service stores its tables in SQLite, not Postgres.
 - CA derivations (`BuildTraceV3`) are unsupported. With `ca-derivations`
   enabled, Nix fails to open the store rather than keep that table locally

@@ -12,6 +12,12 @@ Conflicts with other hosts are reported as HTTP 409, which hosts turn into
 SQLITE_BUSY so that Nix retries the transaction. Nix re-checks what it
 relies on (that a reference is valid, that a path has no referrers) on
 every attempt, so a retry either succeeds or fails with Nix's own error.
+
+Hosts cache what stays true while a path is valid: its row, references,
+and derivation outputs. Every response carries an epoch that goes up
+whenever a commit deletes or changes a path, and a host that sees a new
+epoch drops its cache. A lookup of a path also returns (prefetches) its
+closure, so walking a closure costs about one request.
 """
 
 import argparse
@@ -55,6 +61,8 @@ create table if not exists DerivationOutputs (
     foreign key (drv) references ValidPaths(id) on delete cascade
 );
 create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
+create table if not exists Meta (key text primary key, value integer not null);
+insert or ignore into Meta values ('epoch', 0);
 """
 
 TABLES = {
@@ -124,6 +132,36 @@ def table(req):
     return name, TABLES[name]
 
 
+def epoch(conn):
+    return conn.execute("select value from Meta where key = 'epoch'").fetchone()[0]
+
+
+def closure(conn, ids, limit):
+    """
+    The closure of the paths with these ids, breadth first and at most limit
+    paths, with each path's references and derivation outputs: everything a
+    host needs to walk that far without asking again.
+    """
+    if not ids:
+        return {"paths": [], "refs": [], "outputs": []}
+    members = [row[0] for row in conn.execute(
+        "with recursive closure(id) as ("
+        "  select value from json_each(?1)"
+        "  union select reference from Refs join closure on referrer = closure.id"
+        "  limit ?2"
+        ") select id from closure",
+        (json.dumps(ids), limit),
+    )]
+    members = json.dumps(members)
+    cols = ", ".join(TABLES["ValidPaths"]["cols"])
+    in_members = "in (select value from json_each(?1))"
+    return {
+        "paths": [list(r) for r in conn.execute(f"select {cols} from ValidPaths where id {in_members}", (members,))],
+        "refs": [list(r) for r in conn.execute(f"select referrer, reference from Refs where referrer {in_members}", (members,))],
+        "outputs": [list(r) for r in conn.execute(f"select drv, id, path from DerivationOutputs where drv {in_members}", (members,))],
+    }
+
+
 def execute(conn, sql, params):
     try:
         return conn.execute(sql, params)
@@ -142,6 +180,7 @@ class Store:
         self.pool = queue.LifoQueue()
         self.lock = threading.Lock()
         self.injected_conflicts = 0  # see fail_commits
+        self.requests = {}  # endpoint -> count, for stats
         conn = self.connect()
         conn.executescript(SCHEMA)
         self.pool.put(conn)
@@ -163,6 +202,15 @@ class Store:
             self.pool.put(conn)
 
     def query(self, conn, req):
+        # One read transaction, so that the rows, what they prefetch, and
+        # the epoch all come from the same snapshot.
+        conn.execute("begin")
+        try:
+            return self.query_in(conn, req)
+        finally:
+            conn.execute("commit")
+
+    def query_in(self, conn, req):
         name, t = table(req)
         col, op, limit = req.get("col"), req.get("op"), req.get("limit")
         sql = f"select {', '.join(t['cols'])} from {name}"
@@ -182,7 +230,16 @@ class Store:
                 raise BadRequest(f"bad limit {limit!r}")
             sql += " limit ?"
             params.append(limit)
-        return {"rows": [list(row) for row in conn.execute(sql, params)]}
+        rows = [list(row) for row in conn.execute(sql, params)]
+        result = {"rows": rows, "epoch": epoch(conn)}
+        prefetch = req.get("prefetch")
+        if prefetch is not None:
+            if name != "ValidPaths" or op != "eq":
+                raise BadRequest("only ValidPaths lookups prefetch")
+            if not isinstance(prefetch, int) or not 0 < prefetch <= MAX_LIMIT:
+                raise BadRequest(f"bad prefetch {prefetch!r}")
+            result["prefetch"] = closure(conn, [row[0] for row in rows], prefetch)
+        return result
 
     def commit(self, conn, req):
         ops = req.get("ops")
@@ -196,11 +253,15 @@ class Store:
         try:
             for op in ops:
                 self.apply(conn, op)
+            # Deleting or changing a path invalidates what hosts have cached.
+            if any(op.get("table") == "ValidPaths" and op.get("op") != "insert" for op in ops):
+                conn.execute("update Meta set value = value + 1 where key = 'epoch'")
+            result = {"epoch": epoch(conn)}
         except BaseException:
             conn.execute("rollback")
             raise
         conn.execute("commit")
-        return {}
+        return result
 
     def fail_commits(self, conn, req):
         """Test hook: answer the next `count` commits with a conflict."""
@@ -210,6 +271,15 @@ class Store:
         with self.lock:
             remaining, self.injected_conflicts = self.injected_conflicts, self.injected_conflicts + count
         return {"remaining": remaining}
+
+    def stats(self, conn, req):
+        """Test hook: how many requests each endpoint has served."""
+        with self.lock:
+            return {"requests": dict(self.requests)}
+
+    def count(self, endpoint):
+        with self.lock:
+            self.requests[endpoint] = self.requests.get(endpoint, 0) + 1
 
     def apply(self, conn, op):
         name, t = table(op)
@@ -265,9 +335,11 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/v1/query": store.query, "/v1/commit": store.commit}
         if self.server.test_hooks:
             routes["/v1/test/fail-commits"] = store.fail_commits
+            routes["/v1/test/stats"] = store.stats
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.path not in routes:
             return self.reply(404, {"error": f"no such endpoint {self.path}"})
+        store.count(self.path)
         try:
             req = json.loads(body)
             if not isinstance(req, dict):
