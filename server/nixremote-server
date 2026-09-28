@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+The nixremote metadata service: holds the Nix store tables (ValidPaths,
+Refs, DerivationOutputs) for every host that shares a store, and applies
+each host's transaction atomically.
+
+This is a reference implementation over SQLite. The protocol, described
+in src/backend_http.c, is the contract; a Postgres-backed service can
+replace this one without touching the hosts.
+
+Conflicts with other hosts are reported as HTTP 409, which hosts turn into
+SQLITE_BUSY so that Nix retries the transaction. Nix re-checks what it
+relies on (that a reference is valid, that a path has no referrers) on
+every attempt, so a retry either succeeds or fails with Nix's own error.
+"""
+
+import argparse
+import json
+import os
+import queue
+import sqlite3
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Nix's schema (src/libstore/schema.sql), except that ValidPaths ids come
+# from path_id() rather than autoincrement.
+SCHEMA = """
+create table if not exists ValidPaths (
+    id integer primary key not null,
+    path text unique not null,
+    hash text not null,
+    registrationTime integer not null,
+    deriver text,
+    narSize integer,
+    ultimate integer,
+    sigs text,
+    ca text
+);
+create table if not exists Refs (
+    referrer integer not null,
+    reference integer not null,
+    primary key (referrer, reference),
+    foreign key (referrer) references ValidPaths(id) on delete cascade,
+    foreign key (reference) references ValidPaths(id) on delete restrict
+);
+create index if not exists IndexReference on Refs(reference);
+create trigger if not exists DeleteSelfRefs before delete on ValidPaths
+  begin delete from Refs where referrer = old.id and reference = old.id; end;
+create table if not exists DerivationOutputs (
+    drv integer not null,
+    id text not null,
+    path text not null,
+    primary key (drv, id),
+    foreign key (drv) references ValidPaths(id) on delete cascade
+);
+create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
+"""
+
+TABLES = {
+    "ValidPaths": {
+        "cols": ["id", "path", "hash", "registrationTime", "deriver", "narSize", "ultimate", "sigs", "ca"],
+        "key": "id",
+        "indexed": {"id", "path"},
+        "ordered": {"path"},
+        "upsert": False,
+    },
+    "Refs": {
+        "cols": ["referrer", "reference"],
+        "key": None,
+        "indexed": {"referrer", "reference"},
+        "ordered": set(),
+        "upsert": True,
+    },
+    "DerivationOutputs": {
+        "cols": ["drv", "id", "path"],
+        "key": None,
+        "indexed": {"drv", "path"},
+        "ordered": set(),
+        "upsert": True,
+    },
+}
+
+OPERATORS = {"eq": "=", "ge": ">=", "gt": ">"}
+MAX_LIMIT = 10000
+NIX_BASE32 = "0123456789abcdfghijklmnpqrsvwxyz"
+
+
+def path_id(path):
+    """The ValidPaths id of a store path; nr_path_id in src/common.c."""
+    if not isinstance(path, str):
+        return None
+    base = path.rsplit("/", 1)[-1]
+    if len(base) < 33 or base[32] != "-" or any(c not in NIX_BASE32 for c in base[:32]):
+        return None
+    n = 0
+    for c in base[:13]:
+        n = n << 5 | NIX_BASE32.index(c)
+    return n & (2**63 - 1)
+
+
+class Failure(Exception):
+    status = 500
+
+
+class BadRequest(Failure):
+    status = 400
+
+
+class Conflict(Failure):
+    """Another host changed something this transaction relied on."""
+
+    status = 409
+
+
+class Invalid(Failure):
+    status = 422
+
+
+def table(req):
+    name = req.get("table")
+    if name not in TABLES:
+        raise BadRequest(f"no such table {name!r}")
+    return name, TABLES[name]
+
+
+def execute(conn, sql, params):
+    try:
+        return conn.execute(sql, params)
+    except sqlite3.IntegrityError as e:
+        # A foreign key or uniqueness failure means the database moved on
+        # since the host read it: a reference was deleted, a path gained a
+        # referrer or was registered by someone else.
+        if "FOREIGN KEY" in str(e) or "UNIQUE" in str(e):
+            raise Conflict(str(e)) from e
+        raise Invalid(str(e)) from e
+
+
+class Store:
+    def __init__(self, path):
+        self.path = path
+        self.pool = queue.LifoQueue()
+        self.lock = threading.Lock()
+        self.injected_conflicts = 0  # see fail_commits
+        conn = self.connect()
+        conn.executescript(SCHEMA)
+        self.pool.put(conn)
+
+    def connect(self):
+        conn = sqlite3.connect(self.path, isolation_level=None, timeout=60, check_same_thread=False)
+        conn.execute("pragma journal_mode = wal")
+        conn.execute("pragma foreign_keys = 1")
+        return conn
+
+    def run(self, fn, req):
+        try:
+            conn = self.pool.get_nowait()
+        except queue.Empty:
+            conn = self.connect()
+        try:
+            return fn(conn, req)
+        finally:
+            self.pool.put(conn)
+
+    def query(self, conn, req):
+        name, t = table(req)
+        col, op, limit = req.get("col"), req.get("op"), req.get("limit")
+        sql = f"select {', '.join(t['cols'])} from {name}"
+        params = []
+        if op is not None:
+            allowed = t["indexed"] if op == "eq" else t["ordered"]
+            if op not in OPERATORS or col not in allowed:
+                raise BadRequest(f"cannot look up {name} by {col} {op}")
+            sql += f" where {col} {OPERATORS[op]} ?"
+            params.append(req.get("arg"))
+        if req.get("order"):
+            if col not in t["ordered"]:
+                raise BadRequest(f"cannot order {name} by {col}")
+            sql += f" order by {col}"
+        if limit is not None:
+            if not isinstance(limit, int) or not 0 < limit <= MAX_LIMIT:
+                raise BadRequest(f"bad limit {limit!r}")
+            sql += " limit ?"
+            params.append(limit)
+        return {"rows": [list(row) for row in conn.execute(sql, params)]}
+
+    def commit(self, conn, req):
+        ops = req.get("ops")
+        if not isinstance(ops, list):
+            raise BadRequest("ops must be a list")
+        with self.lock:
+            if self.injected_conflicts > 0:
+                self.injected_conflicts -= 1
+                raise Conflict("injected conflict (--test-hooks)")
+        conn.execute("begin immediate")
+        try:
+            for op in ops:
+                self.apply(conn, op)
+        except BaseException:
+            conn.execute("rollback")
+            raise
+        conn.execute("commit")
+        return {}
+
+    def fail_commits(self, conn, req):
+        """Test hook: answer the next `count` commits with a conflict."""
+        count = req.get("count", 0)
+        if not isinstance(count, int) or count < 0:
+            raise BadRequest(f"bad count {count!r}")
+        with self.lock:
+            remaining, self.injected_conflicts = self.injected_conflicts, self.injected_conflicts + count
+        return {"remaining": remaining}
+
+    def apply(self, conn, op):
+        name, t = table(op)
+        cols, key, kind = t["cols"], t["key"], op.get("op")
+        if kind in ("update", "delete") and not key:
+            raise BadRequest(f"{name} rows cannot be {kind}d")
+        if kind in ("insert", "update"):
+            values = op.get("cols")
+            if not isinstance(values, list) or len(values) != len(cols):
+                raise BadRequest(f"{name} has {len(cols)} columns")
+
+        if kind == "insert":
+            if key:
+                path = values[1]
+                id_ = path_id(path)
+                if id_ is None:
+                    raise Invalid(f"{path!r} is not a store path")
+                row = conn.execute("select path from ValidPaths where id = ?", (id_,)).fetchone()
+                if row and row[0] == path:
+                    raise Conflict(f"{path} is already registered")
+                if row:
+                    raise Invalid(f"id {id_} of {path} collides with {row[0]}")
+                values = [id_] + values[1:]
+            verb = "insert or replace" if t["upsert"] else "insert"
+            execute(conn, f"{verb} into {name} ({', '.join(cols)}) values ({', '.join('?' * len(cols))})", values)
+        elif kind == "update":
+            id_ = op.get("id")
+            if path_id(values[1]) != id_:
+                raise Invalid("a store path's id and path cannot change")
+            sets = ", ".join(f"{c} = ?" for c in cols if c != key)
+            cur = execute(conn, f"update {name} set {sets} where {key} = ?", values[1:] + [id_])
+            if cur.rowcount == 0:
+                raise Conflict(f"{values[1]} is no longer registered")
+        elif kind == "delete":
+            cur = execute(conn, f"delete from {name} where {key} = ?", (op.get("id"),))
+            if cur.rowcount == 0:
+                raise Conflict(f"{name} row {op.get('id')} is already gone")
+        else:
+            raise BadRequest(f"unknown op {kind!r}")
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep connections alive between requests
+
+    def do_GET(self):
+        if self.path == "/v1/health":
+            self.reply(200, {"ok": True})
+        else:
+            self.reply(404, {"error": f"no such endpoint {self.path}"})
+
+    def do_POST(self):
+        store = self.server.store
+        routes = {"/v1/query": store.query, "/v1/commit": store.commit}
+        if self.server.test_hooks:
+            routes["/v1/test/fail-commits"] = store.fail_commits
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path not in routes:
+            return self.reply(404, {"error": f"no such endpoint {self.path}"})
+        try:
+            req = json.loads(body)
+            if not isinstance(req, dict):
+                raise BadRequest("request must be a JSON object")
+            self.reply(200, store.run(routes[self.path], req))
+        except Failure as e:
+            self.reply(e.status, {"error": str(e)})
+        except (ValueError, sqlite3.Error) as e:
+            self.reply(400 if isinstance(e, ValueError) else 500, {"error": str(e)})
+
+    def reply(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        if self.server.verbose:
+            super().log_message(fmt, *args)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("--db", required=True, help="SQLite database holding the store tables")
+    parser.add_argument("--listen", default="127.0.0.1:8080", help="HOST:PORT; port 0 picks a free one")
+    parser.add_argument("--port-file", help="write the port actually listened on here, once listening")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log every request")
+    parser.add_argument("--test-hooks", action="store_true", help="enable /v1/test/ endpoints for fault injection")
+    args = parser.parse_args()
+
+    host, _, port = args.listen.rpartition(":")
+    server = ThreadingHTTPServer((host, int(port)), Handler)
+    server.daemon_threads = True
+    server.store = Store(args.db)
+    server.verbose = args.verbose
+    server.test_hooks = args.test_hooks
+    port = server.server_address[1]
+    print(f"nixremote-server: listening on http://{host}:{port}", file=sys.stderr, flush=True)
+    if args.port_file:
+        with open(args.port_file + ".tmp", "w") as f:
+            f.write(str(port))
+        os.replace(args.port_file + ".tmp", args.port_file)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

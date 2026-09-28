@@ -1,6 +1,6 @@
 /*
- * A backend that keeps the store metadata in another SQLite database: a
- * stand-in for the web service while the virtual table is proven out.
+ * A backend that keeps the store metadata in another SQLite database
+ * (backend='file:...'), for tests and experiments without the service.
  * Its schema is Nix's own, except that ValidPaths ids come from
  * nr_path_id() instead of autoincrement, so foreign keys and the
  * DeleteSelfRefs trigger give the same cascade/restrict behaviour Nix
@@ -13,15 +13,15 @@ SQLITE_EXTENSION_INIT3
 
 #include "backend.h"
 
-struct nr_backend {
+typedef struct {
+  nr_backend base;
   sqlite3 *db;
-  char *err;
-};
+} sqlite_backend;
 
-struct nr_rows {
-  nr_backend *b;
+typedef struct {
+  nr_rows base;
   sqlite3_stmt *stmt;
-};
+} sqlite_rows;
 
 static const char schema[] =
   "create table if not exists ValidPaths ("
@@ -54,42 +54,23 @@ static const char schema[] =
   ");"
   "create index if not exists IndexDerivationOutputs on DerivationOutputs(path);";
 
-static const char nix_base32[] = "0123456789abcdfghijklmnpqrsvwxyz";
-
-sqlite3_int64 nr_path_id(const char *path) {
-  if (!path)
-    return -1;
-  const char *base = strrchr(path, '/');
-  base = base ? base + 1 : path;
-  if (strlen(base) < 33 || base[32] != '-')
-    return -1;
-  sqlite3_uint64 id = 0;
-  for (int i = 0; i < 32; i++) {
-    const char *digit = base[i] ? strchr(nix_base32, base[i]) : NULL;
-    if (!digit)
-      return -1;
-    if (i < 13)
-      id = id << 5 | (sqlite3_uint64)(digit - nix_base32);
-  }
-  return (sqlite3_int64)(id & 0x7fffffffffffffffULL);
+static int set_err(sqlite_backend *b, int rc) {
+  return nr_fail(&b->base, rc, "%s", sqlite3_errmsg(b->db));
 }
 
-static int set_err(nr_backend *b, int rc) {
-  sqlite3_free(b->err);
-  b->err = sqlite3_mprintf("%s", sqlite3_errmsg(b->db));
-  return rc;
-}
-
-static int exec(nr_backend *b, const char *sql) {
+static int exec(sqlite_backend *b, const char *sql) {
   int rc = sqlite3_exec(b->db, sql, NULL, NULL, NULL);
   return rc == SQLITE_OK ? rc : set_err(b, rc);
 }
 
-int nr_backend_open(const char *uri, nr_backend **out, char **errmsg) {
-  nr_backend *b = sqlite3_malloc(sizeof *b);
+static const struct nr_backend_ops sqlite_ops;
+
+int nr_sqlite_open(const char *uri, nr_backend **out, char **errmsg) {
+  sqlite_backend *b = sqlite3_malloc(sizeof *b);
   if (!b)
     return SQLITE_NOMEM;
   memset(b, 0, sizeof *b);
+  b->base.ops = &sqlite_ops;
   int rc = sqlite3_open_v2(uri, &b->db,
                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
   if (rc == SQLITE_OK) {
@@ -102,23 +83,18 @@ int nr_backend_open(const char *uri, nr_backend **out, char **errmsg) {
   if (rc != SQLITE_OK) {
     *errmsg = sqlite3_mprintf("nixremote: opening backend %s: %s", uri,
                               b->db ? sqlite3_errmsg(b->db) : sqlite3_errstr(rc));
-    nr_backend_close(b);
+    nr_backend_close(&b->base);
     return rc;
   }
-  *out = b;
+  *out = &b->base;
   return SQLITE_OK;
 }
 
-void nr_backend_close(nr_backend *b) {
-  if (!b)
-    return;
+static void sqlite_close(nr_backend *base) {
+  sqlite_backend *b = (sqlite_backend *)base;
   sqlite3_close(b->db);
-  sqlite3_free(b->err);
+  sqlite3_free(b->base.err);
   sqlite3_free(b);
-}
-
-const char *nr_backend_errmsg(nr_backend *b) {
-  return b->err ? b->err : "unknown error";
 }
 
 static void append_cols(sqlite3_str *s, const struct nr_table *t, int skip, const char *suffix) {
@@ -131,7 +107,7 @@ static void append_cols(sqlite3_str *s, const struct nr_table *t, int skip, cons
   }
 }
 
-static int prepare(nr_backend *b, sqlite3_str *s, sqlite3_stmt **stmt) {
+static int prepare(sqlite_backend *b, sqlite3_str *s, sqlite3_stmt **stmt) {
   char *sql = sqlite3_str_finish(s);
   if (!sql)
     return SQLITE_NOMEM;
@@ -141,7 +117,7 @@ static int prepare(nr_backend *b, sqlite3_str *s, sqlite3_stmt **stmt) {
 }
 
 /* Step a write statement to completion and finalize it. */
-static int run(nr_backend *b, sqlite3_stmt *stmt) {
+static int run(sqlite_backend *b, sqlite3_stmt *stmt) {
   int rc = sqlite3_step(stmt);
   if (rc == SQLITE_DONE)
     rc = SQLITE_OK;
@@ -151,8 +127,9 @@ static int run(nr_backend *b, sqlite3_stmt *stmt) {
   return rc;
 }
 
-int nr_query(nr_backend *b, const struct nr_table *t, enum nr_op op, int col,
-             sqlite3_value *arg, nr_rows **out) {
+static int sqlite_query(nr_backend *base, const struct nr_table *t, enum nr_op op, int col,
+                        sqlite3_value *arg, nr_rows **out) {
+  sqlite_backend *b = (sqlite_backend *)base;
   sqlite3_str *s = sqlite3_str_new(b->db);
   sqlite3_str_appendall(s, "select ");
   append_cols(s, t, -1, "");
@@ -168,31 +145,30 @@ int nr_query(nr_backend *b, const struct nr_table *t, enum nr_op op, int col,
     return rc;
   if (op != NR_SCAN)
     sqlite3_bind_value(stmt, 1, arg);
-  nr_rows *rows = sqlite3_malloc(sizeof *rows);
+  sqlite_rows *rows = sqlite3_malloc(sizeof *rows);
   if (!rows) {
     sqlite3_finalize(stmt);
     return SQLITE_NOMEM;
   }
-  rows->b = b;
+  rows->base.backend = base;
   rows->stmt = stmt;
-  *out = rows;
+  *out = &rows->base;
   return SQLITE_OK;
 }
 
-int nr_rows_next(nr_rows *rows) {
+static int sqlite_rows_next(nr_rows *base) {
+  sqlite_rows *rows = (sqlite_rows *)base;
   int rc = sqlite3_step(rows->stmt);
-  return rc == SQLITE_ROW || rc == SQLITE_DONE ? rc : set_err(rows->b, rc);
+  return rc == SQLITE_ROW || rc == SQLITE_DONE ? rc : set_err((sqlite_backend *)base->backend, rc);
 }
 
-sqlite3_value *nr_rows_column(nr_rows *rows, int col) {
-  return sqlite3_column_value(rows->stmt, col);
+static sqlite3_value *sqlite_rows_column(nr_rows *base, int col) {
+  return sqlite3_column_value(((sqlite_rows *)base)->stmt, col);
 }
 
-void nr_rows_close(nr_rows *rows) {
-  if (!rows)
-    return;
-  sqlite3_finalize(rows->stmt);
-  sqlite3_free(rows);
+static void sqlite_rows_close(nr_rows *base) {
+  sqlite3_finalize(((sqlite_rows *)base)->stmt);
+  sqlite3_free(base);
 }
 
 /*
@@ -201,7 +177,7 @@ void nr_rows_close(nr_rows *rows) {
  * (reported as SQLITE_CONSTRAINT_UNIQUE, which the caller may retry), and
  * only otherwise a genuine collision between two paths' ids.
  */
-static int explain_id_conflict(nr_backend *b, sqlite3_int64 id, const char *path) {
+static int explain_id_conflict(sqlite_backend *b, sqlite3_int64 id, const char *path) {
   sqlite3_stmt *stmt;
   int same = 0;
   if (sqlite3_prepare_v2(b->db, "select path = ?2 from ValidPaths where id = ?1", -1, &stmt, NULL) == SQLITE_OK) {
@@ -210,25 +186,20 @@ static int explain_id_conflict(nr_backend *b, sqlite3_int64 id, const char *path
     same = sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
   }
-  sqlite3_free(b->err);
-  if (same) {
-    b->err = sqlite3_mprintf("%s is already registered", path);
-    return SQLITE_CONSTRAINT_UNIQUE;
-  }
-  b->err = sqlite3_mprintf("id %lld of %s collides with another store path", id, path);
-  return SQLITE_CONSTRAINT_PRIMARYKEY;
+  if (same)
+    return nr_fail(&b->base, SQLITE_CONSTRAINT_UNIQUE, "%s is already registered", path);
+  return nr_fail(&b->base, SQLITE_CONSTRAINT_PRIMARYKEY, "id %lld of %s collides with another store path",
+                 id, path);
 }
 
-int nr_insert(nr_backend *b, const struct nr_table *t, sqlite3_value **cols,
-              sqlite3_int64 *rowid) {
+static int sqlite_insert(nr_backend *base, const struct nr_table *t, sqlite3_value **cols,
+                         sqlite3_int64 *rowid) {
+  sqlite_backend *b = (sqlite_backend *)base;
   sqlite3_int64 id = 0;
   if (t->rowid_col >= 0) {
     id = nr_path_id((const char *)sqlite3_value_text(cols[1]));
-    if (id < 0) {
-      sqlite3_free(b->err);
-      b->err = sqlite3_mprintf("\"%s\" is not a store path", sqlite3_value_text(cols[1]));
-      return SQLITE_CONSTRAINT;
-    }
+    if (id < 0)
+      return nr_fail(base, SQLITE_CONSTRAINT, "\"%s\" is not a store path", sqlite3_value_text(cols[1]));
   }
 
   sqlite3_str *s = sqlite3_str_new(b->db);
@@ -257,8 +228,9 @@ int nr_insert(nr_backend *b, const struct nr_table *t, sqlite3_value **cols,
   return rc;
 }
 
-int nr_update(nr_backend *b, const struct nr_table *t, sqlite3_int64 rowid,
-              sqlite3_value **cols) {
+static int sqlite_update(nr_backend *base, const struct nr_table *t, sqlite3_int64 rowid,
+                         sqlite3_value **cols) {
+  sqlite_backend *b = (sqlite_backend *)base;
   sqlite3_str *s = sqlite3_str_new(b->db);
   sqlite3_str_appendf(s, "update %s set ", t->name);
   append_cols(s, t, t->rowid_col, " = ?");
@@ -276,7 +248,8 @@ int nr_update(nr_backend *b, const struct nr_table *t, sqlite3_int64 rowid,
   return run(b, stmt);
 }
 
-int nr_delete(nr_backend *b, const struct nr_table *t, sqlite3_int64 rowid) {
+static int sqlite_delete(nr_backend *base, const struct nr_table *t, sqlite3_int64 rowid) {
+  sqlite_backend *b = (sqlite_backend *)base;
   sqlite3_str *s = sqlite3_str_new(b->db);
   sqlite3_str_appendf(s, "delete from %s where %s = ?1", t->name, t->cols[t->rowid_col]);
   sqlite3_stmt *stmt;
@@ -287,14 +260,28 @@ int nr_delete(nr_backend *b, const struct nr_table *t, sqlite3_int64 rowid) {
   return run(b, stmt);
 }
 
-int nr_begin(nr_backend *b) {
-  return exec(b, "begin immediate");
+static int sqlite_begin(nr_backend *b) {
+  return exec((sqlite_backend *)b, "begin immediate");
 }
 
-int nr_commit(nr_backend *b) {
-  return exec(b, "commit");
+static int sqlite_commit(nr_backend *b) {
+  return exec((sqlite_backend *)b, "commit");
 }
 
-int nr_rollback(nr_backend *b) {
-  return exec(b, "rollback");
+static int sqlite_rollback(nr_backend *b) {
+  return exec((sqlite_backend *)b, "rollback");
 }
+
+static const struct nr_backend_ops sqlite_ops = {
+  .close = sqlite_close,
+  .query = sqlite_query,
+  .rows_next = sqlite_rows_next,
+  .rows_column = sqlite_rows_column,
+  .rows_close = sqlite_rows_close,
+  .insert = sqlite_insert,
+  .update = sqlite_update,
+  .delete = sqlite_delete,
+  .begin = sqlite_begin,
+  .commit = sqlite_commit,
+  .rollback = sqlite_rollback,
+};
