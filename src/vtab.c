@@ -17,47 +17,6 @@ SQLITE_EXTENSION_INIT1
 
 #include "backend.h"
 
-static const char *const valid_paths_cols[] = {
-  "id", "path", "hash", "registrationTime", "deriver", "narSize", "ultimate", "sigs", "ca",
-};
-const struct nr_table nr_valid_paths = {
-  .name = "ValidPaths",
-  .decl = "CREATE TABLE x(id INTEGER, path TEXT, hash TEXT, registrationTime INTEGER,"
-          " deriver TEXT, narSize INTEGER, ultimate INTEGER, sigs TEXT, ca TEXT)",
-  .ncols = 9,
-  .cols = valid_paths_cols,
-  .rowid_col = 0,
-  .indexed = 1u << 0 | 1u << 1,
-  .unique = 1u << 0 | 1u << 1,
-  .ordered = 1u << 1,
-};
-
-static const char *const refs_cols[] = { "referrer", "reference" };
-const struct nr_table nr_refs = {
-  .name = "Refs",
-  .decl = "CREATE TABLE x(referrer INTEGER, reference INTEGER)",
-  .ncols = 2,
-  .cols = refs_cols,
-  .rowid_col = -1,
-  .indexed = 1u << 0 | 1u << 1,
-  .upsert = 1,
-};
-
-static const char *const derivation_outputs_cols[] = { "drv", "id", "path" };
-const struct nr_table nr_derivation_outputs = {
-  .name = "DerivationOutputs",
-  .decl = "CREATE TABLE x(drv INTEGER, id TEXT, path TEXT)",
-  .ncols = 3,
-  .cols = derivation_outputs_cols,
-  .rowid_col = -1,
-  .indexed = 1u << 0 | 1u << 2,
-  .upsert = 1,
-};
-
-const struct nr_table *const nr_tables[3] = {
-  &nr_valid_paths, &nr_refs, &nr_derivation_outputs,
-};
-
 /*
  * One backend connection per (front database connection, backend URI),
  * shared by the three virtual tables so that they see one transaction.

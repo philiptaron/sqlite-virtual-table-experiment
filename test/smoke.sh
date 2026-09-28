@@ -5,6 +5,11 @@
 # each with its own state directory and so its own db.sqlite pointer file;
 # a may not delete store paths, b may. A plain chroot store with an
 # ordinary db.sqlite is the control: every query must answer the same there.
+#
+#   test/smoke.sh [http|sqlite]
+#
+# http (the default) runs server/nixremote-server as the backend; sqlite
+# has the hosts open the backend database directly.
 set -euo pipefail
 [[ -n ${IN_NIX_SHELL:-} ]] || exec nix develop --quiet -c bash "$0" "$@"
 
@@ -14,9 +19,29 @@ for lib in "$PWD"/libnixremote.{so,dylib}; do [[ -e $lib ]] && break; done
 
 # Nix refuses store directories under a symlink, such as /tmp on macOS.
 work=$(cd "$(mktemp -d)" && pwd -P)
-trap 'chmod -R u+w "$work"; rm -rf "$work"' EXIT
+server_pid=
+trap '[[ -z $server_pid ]] || kill $server_pid; chmod -R u+w "$work"; rm -rf "$work"' EXIT
 
-backend="file:$work/remote.sqlite"
+case ${1:-http} in
+  sqlite)
+    backend="file:$work/remote.sqlite"
+    ;;
+  http)
+    server/nixremote-server --db "$work/remote.sqlite" --listen 127.0.0.1:0 --port-file "$work/port" --test-hooks 2>"$work/server.log" &
+    server_pid=$!
+    for _ in $(seq 100); do
+      [[ -e $work/port ]] && break
+      sleep 0.1
+    done
+    [[ -e $work/port ]] || { cat "$work/server.log"; exit 1; }
+    backend="http://127.0.0.1:$(cat "$work/port")"
+    ;;
+  *)
+    echo "usage: $0 [http|sqlite]" >&2
+    exit 2
+    ;;
+esac
+echo "# backend: $backend"
 NIXREMOTE_LIB=$lib scripts/nixremote-mkstate "$work/a" "$backend" deny >/dev/null
 NIXREMOTE_LIB=$lib scripts/nixremote-mkstate "$work/b" "$backend" allow >/dev/null
 a="local?root=$work/root&state=$work/a"
@@ -85,6 +110,11 @@ drv=$(nixr nix-instantiate --store "$a" -E "$expr")
 nix-instantiate --store "$control" -E "$expr" >/dev/null
 same "derivation outputs" nix-store --store @ -q --outputs "$drv"
 [[ $(backend_count DerivationOutputs) == 1 ]] && ok "backend has the derivation output" || not_ok "backend has $(backend_count DerivationOutputs) derivation outputs, want 1"
+# Enough paths that scanning them all takes several pages from the service.
+many='builtins.genList (i: derivation { name = "nixremote-many-${toString i}"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo ${toString i} > $out" ]; }) 40'
+nixr nix-instantiate --store "$a" -E "$many" >/dev/null 2>&1
+nix-instantiate --store "$control" -E "$many" >/dev/null 2>&1
+same "all valid paths, across several pages" nix path-info --store @ --all
 
 echo "# a second host sharing the store"
 if diff <(nixr nix path-info --store "$b" --all) <(nixr nix path-info --store "$a" --all) >/dev/null; then
@@ -99,7 +129,7 @@ if nixr nix store gc --store "$a" >/dev/null 2>"$work/gc-a.err"; then
 else
   grep -q 'deletes=deny' "$work/gc-a.err" && ok "gc on host a is refused" || { not_ok "gc on host a failed for another reason"; sed 's/^/     /' "$work/gc-a.err"; }
 fi
-[[ $(backend_count ValidPaths) == $((n + 1)) ]] && ok "refused gc deleted nothing" || not_ok "refused gc left $(backend_count ValidPaths) paths"
+[[ $(backend_count ValidPaths) == $((n + 41)) ]] && ok "refused gc deleted nothing" || not_ok "refused gc left $(backend_count ValidPaths) paths"
 
 if nixr nix store delete --store "$b" "$(head -n1 <<<"$closure")" >/dev/null 2>&1; then
   not_ok "deleting a referenced path should fail"
@@ -132,12 +162,24 @@ wait $pid_b || rc_b=$?
 nix copy --no-check-sigs --to "$control" "$top" 2>/dev/null
 same "path info after concurrent copies" nix path-info --store @ -r --size --closure-size --sigs "$top"
 
+if [[ $backend == http* ]]; then
+  echo "# a commit that conflicts with another host is retried by Nix"
+  fail_commits() { curl -sf -H 'Content-Type: application/json' -d "{\"count\":$1}" "$backend/v1/test/fail-commits"; }
+  fail_commits 1 >/dev/null
+  if nixr nix-instantiate --store "$a" -E "${expr/nixremote-test/nixremote-retry}" >/dev/null 2>"$work/retry.err"; then
+    [[ $(fail_commits 0) == '{"remaining": 0}' ]] && ok "registration succeeds after an injected conflict" || not_ok "the injected conflict was never hit"
+  else
+    not_ok "registration after an injected conflict"
+    sed 's/^/     /' "$work/retry.err"
+  fi
+fi
+
 echo "# a path registered behind Nix's back reads as a retryable conflict"
 sqlite3 "$work/b/db/db.sqlite" >"$work/conflict.out" 2>&1 <<EOF || true
 .load $lib sqlite3_nixremote_init
 insert into ValidPaths (path, hash, registrationTime) values ('$(head -n1 <<<"$closure")', 'sha256:00', 0);
 EOF
-grep -q 'registered concurrently' "$work/conflict.out" && ok "duplicate insert is SQLITE_BUSY" || { not_ok "duplicate insert"; sed 's/^/     /' "$work/conflict.out"; }
+grep -Eq 'registered concurrently|already registered' "$work/conflict.out" && ok "duplicate insert is SQLITE_BUSY" || { not_ok "duplicate insert"; sed 's/^/     /' "$work/conflict.out"; }
 
 echo
 if [[ $failures == 0 ]]; then
