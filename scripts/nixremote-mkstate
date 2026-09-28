@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Create a Nix state directory whose db.sqlite points at a nixremote backend.
+#
+#   nixremote-mkstate STATE_DIR BACKEND_URI [deny|allow]
+#
+# STATE_DIR is what Nix calls the state directory (/nix/var/nix, or the
+# `state=` of a local store URL). The third argument says whether this host
+# may delete store paths (garbage collect); it defaults to deny.
+#
+# The plugin is found at $NIXREMOTE_LIB, or next to this script in ../lib.
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: $0 STATE_DIR BACKEND_URI [deny|allow]" >&2
+  exit 2
+fi
+state=$1
+backend=$2
+deletes=${3:-deny}
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+lib=${NIXREMOTE_LIB:-}
+if [[ -z $lib ]]; then
+  for candidate in "$here"/../lib/libnixremote.{so,dylib} "$here"/../libnixremote.{so,dylib}; do
+    [[ -e $candidate ]] && lib=$candidate && break
+  done
+fi
+if [[ -z $lib ]]; then
+  echo "$0: cannot find libnixremote; set NIXREMOTE_LIB" >&2
+  exit 1
+fi
+
+db=$state/db/db.sqlite
+if [[ -e $db ]]; then
+  echo "$0: $db already exists" >&2
+  exit 1
+fi
+mkdir -p "$state/db"
+
+# Single quotes inside the SQL string literal are doubled.
+args="backend='${backend//\'/\'\'}', deletes=$deletes"
+
+# SchemaMigrations stays a real (local, constant) table. Listing the
+# migrations Nix knows about keeps it from trying to run them here; the
+# CA-derivations one is deliberately absent, so enabling ca-derivations
+# fails loudly instead of creating a host-local BuildTraceV3 table.
+sqlite3 "$db" <<EOF
+.bail on
+.load $lib sqlite3_nixremote_init
+pragma journal_mode = wal;
+create table SchemaMigrations (migration text primary key not null);
+insert into SchemaMigrations values ('20260309-drop-redundant-indexreferrer');
+create virtual table ValidPaths using nixremote($args);
+create virtual table Refs using nixremote($args);
+create virtual table DerivationOutputs using nixremote($args);
+EOF
+
+# Nix's schema version (nixSchemaVersion). Matching it means Nix opens the
+# database as-is instead of creating or migrating tables.
+printf 10 > "$state/db/schema"
