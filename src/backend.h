@@ -1,0 +1,68 @@
+/*
+ * The boundary between the virtual table module (vtab.c) and whatever
+ * actually holds the store metadata. backend_sqlite.c is a stand-in for
+ * the web service: another SQLite file, shared by every "host".
+ */
+#ifndef NIXREMOTE_BACKEND_H
+#define NIXREMOTE_BACKEND_H
+
+#include <sqlite3ext.h>
+
+/* The three tables of Nix's store schema (src/libstore/schema.sql). */
+struct nr_table {
+  const char *name;
+  const char *decl;        /* for sqlite3_declare_vtab */
+  int ncols;
+  const char *const *cols;
+  int rowid_col;           /* integer key column, or -1 if rows have none */
+  unsigned indexed;        /* bitmask of columns the backend can look up by equality */
+  unsigned unique;         /* ...of which these are unique */
+  unsigned ordered;        /* ...and these can be scanned from a lower bound */
+  int upsert;              /* Nix writes this table with "insert or replace" */
+};
+
+extern const struct nr_table nr_valid_paths, nr_refs, nr_derivation_outputs;
+extern const struct nr_table *const nr_tables[3];
+
+enum nr_op { NR_SCAN, NR_EQ, NR_GE };
+
+typedef struct nr_backend nr_backend;
+typedef struct nr_rows nr_rows;
+
+int nr_backend_open(const char *uri, nr_backend **out, char **errmsg);
+void nr_backend_close(nr_backend *);
+/* Message for the most recent failure; valid until the next call. */
+const char *nr_backend_errmsg(nr_backend *);
+
+/* Rows of t where cols[col] = arg (NR_EQ), cols[col] >= arg in column order
+ * (NR_GE), or all rows (NR_SCAN, col and arg ignored). */
+int nr_query(nr_backend *, const struct nr_table *t, enum nr_op op, int col,
+             sqlite3_value *arg, nr_rows **out);
+int nr_rows_next(nr_rows *);  /* SQLITE_ROW, SQLITE_DONE, or an error */
+sqlite3_value *nr_rows_column(nr_rows *, int col);
+void nr_rows_close(nr_rows *);
+
+/* cols has t->ncols entries. For ValidPaths the backend ignores cols[0] and
+ * assigns nr_path_id(path); *rowid receives the new row's key. */
+int nr_insert(nr_backend *, const struct nr_table *t, sqlite3_value **cols,
+              sqlite3_int64 *rowid);
+int nr_update(nr_backend *, const struct nr_table *t, sqlite3_int64 rowid,
+              sqlite3_value **cols);
+/* Deleting a ValidPaths row cascades to the Refs and DerivationOutputs
+ * rows that hang off it, and fails if another path still refers to it. */
+int nr_delete(nr_backend *, const struct nr_table *t, sqlite3_int64 rowid);
+
+int nr_begin(nr_backend *);
+int nr_commit(nr_backend *);
+int nr_rollback(nr_backend *);
+
+/*
+ * The ValidPaths id of a store path. The hash part of
+ * /nix/store/<hash>-<name> is 32 characters of Nix's base32 and already
+ * uniformly random, so folding its first 13 characters (65 bits) into 63
+ * bits gives an id that every host computes without asking anyone.
+ * Returns -1 if path doesn't look like a store path.
+ */
+sqlite3_int64 nr_path_id(const char *path);
+
+#endif
