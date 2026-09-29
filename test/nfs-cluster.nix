@@ -409,21 +409,18 @@ in
         assert built_by_client1 != cached, f"{raced} still holds what the cache held"
         client3.succeed(f"nix-store --store '{store}' --verify-path {raced}")
         # client2's commit conflicts, since raced is registered now. On the
-        # retry, Nix finds raced valid and updates its row with client2's
-        # hash, which the service allows.
+        # retry, Nix finds raced valid and goes to update its row with
+        # client2's hash, which the service refuses, so client2's
+        # substitution fails.
         released = hook("release-commits")
         assert released == {"released": 1}, f"released {released}, want client2's one commit"
         rc, err = outcome(client2, "raced")
         report(client2, "raced", rc, err)
-        assert rc == "0", f"client2's substitution of nixremote-raced should have succeeded, not exited {rc}"
-        # So the files are client1's and the hash is the cache's.
+        assert rc != "0" and "is registered with hash" in err, f"client2's substitution of nixremote-raced should have been refused, not exited {rc}"
+        # So the files are client1's and so is the hash.
         for m in clients:
             got = m.succeed(f"cat /shared{raced}")
             assert got == built_by_client1, f"{m.name} reads {got!r} from {raced}, not client1's output {built_by_client1!r}"
-            m.fail(f"nix-store --store '{store}' --verify-path {raced}")
-        # Substituting it again puts back what the hash says.
-        client3.succeed(f"timeout 300 nix-store --store '{store}&require-sigs=false' --repair-path {raced} --option substituters file:///cache")
-        for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify-path {raced}")
 
     with subtest("in the end, every client agrees on the store's contents"):
