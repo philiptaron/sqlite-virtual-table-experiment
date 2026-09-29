@@ -13,7 +13,7 @@ LDSHARED = -shared
 endif
 
 LIB = libnixremote.$(SOEXT)
-OBJS = src/vtab.o src/common.o src/backend_sqlite.o src/backend_http.o src/plugin.o
+OBJS = src/vtab.o src/common.o src/lock.o src/backend_sqlite.o src/backend_http.o src/plugin.o
 
 all: $(LIB)
 
