@@ -271,6 +271,26 @@ path's lock. Only the host can, before it deletes and moves anything.
 The check also refuses `--repair` of a derivation that isn't
 reproducible, which gives the path a new hash.
 
+A host can tell that it lost a lock, but only by asking the server. The
+test has a probe (`test/lockprobe.py`) take a lock on the export like
+Nix's, on client1 and then on client2 once client1 is cut off, and try
+what a process can check on its own descriptor. On Linux 6.18:
+
+| Check | client2, holding the lock | client1, having lost it |
+|---|---|---|
+| `fstat`, `pread`, `pwrite` of nothing | ok | ok |
+| `pread` with `O_DIRECT` | ok | EIO |
+| its line in `/proc/locks` | there | still there |
+| `F_SETLK` again | ok | EAGAIN, since client2 holds it |
+
+An NFS client that marks a lock lost fails reads and writes under it
+with EIO, but the lock file is empty, so an ordinary read never reaches
+the server. `O_DIRECT` makes it. It fails as soon as client1 is back, so
+a host could check this before it deletes and moves anything. Taking the
+lock again isn't a check: with no one else holding it, it may succeed.
+The probe must never close another descriptor for the lock file, since
+closing any of them drops all of the process's locks on it.
+
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
 back to emulation. To see the host's servers it sets `__noChroot`, which

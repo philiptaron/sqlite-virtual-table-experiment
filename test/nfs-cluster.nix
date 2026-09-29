@@ -473,7 +473,7 @@ in
         # off, and by client2 once nfsd's lease runs out. Each then tries
         # what a process could check about its own lock (lockprobe.py):
         # client2 while it holds it, and client1 once it's back, both right
-        # away and once its NFS client has found the lock lost.
+        # away and once its kernel has logged the lock lost.
         lock = "/shared/nixremote-probe.lock"
         client1.succeed(f"systemd-run --unit=lockprobe --collect /run/current-system/sw/bin/lockprobe {lock} /tmp/probe-go /tmp/probe.out")
         client1.wait_until_succeeds("grep -qx locked /tmp/probe.out", timeout=60)
@@ -493,10 +493,20 @@ in
         print(f"client1's kernel says: {lost.strip()}")
         client1.succeed("touch /tmp/probe-go.again")
         client1.wait_until_succeeds("grep -q '\"again\"' /tmp/probe.out", timeout=300)
+        probes = {}
         for m in (client2, client1):
             print(f"{m.name}, {'holding the lock' if m == client2 else 'having lost it'}:")
             for line in m.succeed("grep '^{' /tmp/probe.out").splitlines():
                 print(f"  {line}")
+                probe = json.loads(line)
+                probes[m.name, probe["round"]] = probe
+        # Only a read that has to reach the server tells: the file is empty,
+        # so an ordinary read never does. /proc/locks keeps the lost lock,
+        # and taking it again might just succeed if no one else had it.
+        for round in ("first", "again"):
+            assert probes["client2", round]["pread O_DIRECT"].startswith("ok"), f"client2's O_DIRECT read of its own lock failed: {probes['client2', round]}"
+            assert probes["client1", round]["pread O_DIRECT"] == "EIO", f"client1's O_DIRECT read didn't show its lock lost: {probes['client1', round]}"
+            assert probes["client1", round]["pread"].startswith("ok"), f"client1's ordinary read now shows its lock lost: {probes['client1', round]}"
         for m in (client1, client2):
             m.succeed("touch /tmp/probe-go.exit")
             m.wait_until_succeeds("! systemctl is-active lockprobe", timeout=60)
