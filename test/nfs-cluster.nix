@@ -46,6 +46,7 @@ let
           "$@" >/tmp/"$round".out 2>/tmp/"$round".err || rc=$?
         echo $rc >/tmp/"$round".rc
       '';
+      lockProbe = pkgs.writeShellScriptBin "lockprobe" ''exec ${pkgs.python3}/bin/python3 ${./lockprobe.py} "$@"'';
     in
     {
       virtualisation.memorySize = 1536;
@@ -76,6 +77,7 @@ let
       environment.systemPackages = [
         nixremote
         clusterBuild
+        lockProbe
         pkgs.curl
         pkgs.iptables
         pkgs.sqlite
@@ -465,6 +467,40 @@ in
         client3.succeed(f"timeout 300 nix-store --store '{store}&require-sigs=false' --repair-path {overtaken} --option substituters file:///cache")
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify-path {overtaken}")
+
+    with subtest("what a client that lost its lock can tell"):
+        # A lock on the export like Nix's, taken by client1 before it's cut
+        # off, and by client2 once nfsd's lease runs out. Each then tries
+        # what a process could check about its own lock (lockprobe.py):
+        # client2 while it holds it, and client1 once it's back, both right
+        # away and once its NFS client has found the lock lost.
+        lock = "/shared/nixremote-probe.lock"
+        client1.succeed(f"systemd-run --unit=lockprobe --collect /run/current-system/sw/bin/lockprobe {lock} /tmp/probe-go /tmp/probe.out")
+        client1.wait_until_succeeds("grep -qx locked /tmp/probe.out", timeout=60)
+        # The earlier subtests lost client1 some locks too.
+        losses = client1.succeed("dmesg | grep -c 'lost .* locks' || true").strip()
+        cut_off(client1)
+        start = time.monotonic()
+        client2.succeed("touch /tmp/probe-go /tmp/probe-go.again")
+        client2.succeed(f"systemd-run --unit=lockprobe --collect /run/current-system/sw/bin/lockprobe {lock} /tmp/probe-go /tmp/probe.out")
+        client2.wait_until_succeeds("grep -q '\"again\"' /tmp/probe.out", timeout=300)
+        print(f"with client1 cut off, client2 took the lock after {time.monotonic() - start:.0f}s")
+        reconnect(client1)
+        client1.succeed("touch /tmp/probe-go")
+        client1.wait_until_succeeds("grep -q '\"first\"' /tmp/probe.out", timeout=300)
+        client1.wait_until_succeeds(f"[ $(dmesg | grep -c 'lost .* locks') -gt {losses} ]", timeout=120)
+        lost = client1.succeed("dmesg | grep 'lost .* locks' | tail -n1")
+        print(f"client1's kernel says: {lost.strip()}")
+        client1.succeed("touch /tmp/probe-go.again")
+        client1.wait_until_succeeds("grep -q '\"again\"' /tmp/probe.out", timeout=300)
+        for m in (client2, client1):
+            print(f"{m.name}, {'holding the lock' if m == client2 else 'having lost it'}:")
+            for line in m.succeed("grep '^{' /tmp/probe.out").splitlines():
+                print(f"  {line}")
+        for m in (client1, client2):
+            m.succeed("touch /tmp/probe-go.exit")
+            m.wait_until_succeeds("! systemctl is-active lockprobe", timeout=60)
+        client3.succeed(f"rm {lock}")
 
     with subtest("in the end, every client agrees on the store's contents"):
         paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken}"
