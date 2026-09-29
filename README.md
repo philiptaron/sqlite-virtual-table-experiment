@@ -106,16 +106,40 @@ store `local?root=/shared&state=/var/lib/nixremote`. Then:
   rebuilding any of them;
 - every client agrees on the closure and verifies the store's contents.
 
-The test found that reading what another host just wrote is slow, about
-100ms per file. nfsd gives the writer a write delegation on every file it
-creates, and the writer keeps them. A reader's OPEN of such a file gets
-NFS4ERR_DELAY while nfsd recalls the delegation. The writer returns it
-within milliseconds, but the reader's Linux client waits about 100ms
-before retrying. The first client to check busybox's roughly 900 files
-after client1 copied it in spent 95 seconds on this, against 2.5 seconds
-with delegations turned off (`fs.leases-enable=0` on the server). The
-trace step shows it: counts of NFS4ERR_DELAY per connection, the
-recalls, and each client's delegations sampled once a second.
+### Delegations: set `nfsv4.delegation_watermark=0` on every host
+
+By default, reading what another host just wrote costs about 100ms per
+file. nfsd gives the writer a write delegation on every file it creates.
+The writer's Linux client keeps them, up to `delegation_watermark` (5000)
+of them. Another host's OPEN of such a file gets NFS4ERR_DELAY while nfsd
+recalls the delegation. The writer returns it within milliseconds, but
+the reader's client waits 100ms before retrying (`NFS4_POLL_RETRY_MIN`,
+fixed in the kernel). nfsd's OPEN doesn't wait for the recall, although
+its SETATTR, RENAME, and UNLINK wait up to 30ms. The first client to
+check busybox's roughly 900 files after client1 copied it in spent 95
+seconds on this.
+
+The hosts in the test set this, which they load as an `nfsv4` module
+option, not `nfs`:
+
+```
+options nfsv4 delegation_watermark=0
+```
+
+A client then returns each delegation when the file is last closed. For
+Nix that is right after writing it, before any other host reads it. The
+same check took 2.4 seconds, and nfsd recalled 2 delegations instead of
+904. The cost is a DELEGRETURN per file on the writer. The server keeps
+its defaults.
+
+nfsd has no per-export or write-only switch for delegations. The one
+server-side alternative is `sysctl fs.leases-enable=0`, which stops
+delegations of every kind for the whole host. It also took 2.5 seconds,
+and suits a server that does nothing else. The test's last subtest fails
+if any client's failed OPENs reach 100, which is how a writer keeping its
+delegations shows up. The trace step shows the details: NFS4ERR_DELAY and
+recalls per connection, and each client's delegations sampled once a
+second.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
@@ -147,7 +171,6 @@ test/ci-host.sh verify
   enabled, Nix fails to open the store rather than keep that table locally
   on one host.
 - On NFS, only what the cluster test exercises is known to work: build
-  locks across hosts and reading what another host wrote. Reading what
-  another host wrote costs about 100ms per file while nfsd hands out
-  write delegations (see above). Client caching and write ordering under
-  failures are still ahead.
+  locks across hosts and reading what another host wrote, with
+  `delegation_watermark=0` on the hosts (see above). Client caching and
+  write ordering under failures are still ahead.
