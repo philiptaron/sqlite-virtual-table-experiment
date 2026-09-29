@@ -68,9 +68,21 @@ case ${1:-} in
     fi
     echo "$(wc -l <<<"$registered") store paths, each registered with the service and present on the export:"
     echo "$registered"
-    for name in shared client1 client2 client3 combined interrupted dropped applied cutoff substituted; do
+    for name in shared client1 client2 client3 combined interrupted dropped applied cutoff substituted raced; do
       grep -q -- "-nixremote-$name\$" <<<"$registered" || { echo "no nixremote-$name output"; exit 1; }
     done
+    # And what's on the export has the hash the service holds for it: a NAR
+    # hash, which Nix stores as sha256:<hex>.
+    mismatched=0
+    while IFS='|' read -r path hash; do
+      got=sha256:$(nix-store --dump "$export_dir$path" | sha256sum | cut -d' ' -f1)
+      if [[ $got != "$hash" ]]; then
+        echo "$path has hash $got on the export, but $hash registered"
+        mismatched=1
+      fi
+    done < <(sqlite3 "$db" 'select path, hash from ValidPaths')
+    [[ $mismatched == 0 ]] || exit 1
+    echo "and each one's contents match the hash the service holds"
     ;;
 
   logs)
