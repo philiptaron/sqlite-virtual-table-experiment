@@ -133,15 +133,14 @@ class Invalid(Failure):
 
 
 class Dropped(Failure):
-    """A held commit released without applying it (see hold_commits)."""
+    """A held commit released without applying it (see hold)."""
 
     status = 503
 
 
 class Hold:
-    """Commits waiting on /v1/test/release-commits: the next `count` of those
-    that register, change or delete the path with id `id_`, or every commit
-    if either is None."""
+    """Requests waiting to be released (see Store.hold): the next `count` of
+    those about the path with id `id_`, or every one if either is None."""
 
     def __init__(self, id_, count):
         self.id = id_
@@ -150,10 +149,10 @@ class Hold:
         self.drop = False
         self.released = threading.Event()
 
-    def takes(self, ops):
+    def takes(self, ids):
         if self.count is not None and self.waiting >= self.count:
             return False
-        return self.id is None or any(op_path_id(op) == self.id for op in ops)
+        return self.id is None or self.id in ids
 
 
 def table(req):
@@ -171,6 +170,15 @@ def op_path_id(op):
         cols = op.get("cols")
         return path_id(cols[1]) if isinstance(cols, list) and len(cols) > 1 else None
     return op.get("id")
+
+
+def query_path_id(req):
+    """The ValidPaths id a query looks up, if it looks up one path."""
+    if req.get("table") != "ValidPaths" or req.get("op") != "eq":
+        return None
+    if req.get("col") == "path":
+        return path_id(req.get("arg"))
+    return req.get("arg") if req.get("col") == "id" else None
 
 
 def epoch(conn):
@@ -221,7 +229,7 @@ class Store:
         self.pool = queue.LifoQueue()
         self.lock = threading.Lock()
         self.injected_conflicts = 0  # see fail_commits
-        self.hold = None  # see hold_commits
+        self.holds = {"commits": None, "queries": None}  # see hold
         self.requests = {}  # endpoint -> count, for stats
         conn = self.connect()
         conn.executescript(SCHEMA)
@@ -248,9 +256,12 @@ class Store:
         # the epoch all come from the same snapshot.
         conn.execute("begin")
         try:
-            return self.query_in(conn, req)
+            result = self.query_in(conn, req)
         finally:
             conn.execute("commit")
+        # A held answer is still the one from when the query arrived.
+        self.wait_if_held("queries", {query_path_id(req)})
+        return result
 
     def query_in(self, conn, req):
         name, t = table(req)
@@ -291,15 +302,7 @@ class Store:
             if self.injected_conflicts > 0:
                 self.injected_conflicts -= 1
                 raise Conflict("injected conflict (--test-hooks)")
-            hold = self.hold
-            if hold and not hold.takes(ops):
-                hold = None
-            if hold:
-                hold.waiting += 1
-        if hold:
-            hold.released.wait()
-            if hold.drop:
-                raise Dropped("held commit dropped (--test-hooks)")
+        self.wait_if_held("commits", {op_path_id(op) for op in ops})
         conn.execute("begin immediate")
         try:
             for op in ops:
@@ -323,13 +326,30 @@ class Store:
             remaining, self.injected_conflicts = self.injected_conflicts, self.injected_conflicts + count
         return {"remaining": remaining}
 
-    def hold_commits(self, conn, req):
-        """Test hook: make commits wait, having been received in full, until
-        release_commits. A host that dies meanwhile has sent its commit but
-        never learns whether it was applied. With `path`, only commits that
-        touch that path's ValidPaths row wait, and with `count`, only the
-        next `count` of them; the others go ahead. Hosts can't be told apart
-        by address, since they may all come through one NAT."""
+    def wait_if_held(self, kind, ids):
+        with self.lock:
+            hold = self.holds[kind]
+            if hold and not hold.takes(ids):
+                hold = None
+            if hold:
+                hold.waiting += 1
+        if hold:
+            hold.released.wait()
+            if hold.drop:
+                raise Dropped(f"held {kind} dropped (--test-hooks)")
+
+    def hold(self, kind, req):
+        """Test hook: make commits or queries wait until released.
+
+        A held commit has been received in full, so a host that dies
+        meanwhile has sent it but never learns whether it was applied. A
+        held query has been answered, but the answer isn't sent, so the host
+        acts on it only once the database may have moved on.
+
+        With `path`, only those about that path's ValidPaths row wait, and
+        with `count`, only the next `count` of them; the others go ahead.
+        Hosts can't be told apart by address, since they may all come
+        through one NAT."""
         path, count = req.get("path"), req.get("count")
         id_ = None if path is None else path_id(path)
         if path is not None and id_ is None:
@@ -337,16 +357,17 @@ class Store:
         if count is not None and (not isinstance(count, int) or count < 1):
             raise BadRequest(f"bad count {count!r}")
         with self.lock:
-            if self.hold:
-                raise BadRequest("commits are held already")
-            self.hold = Hold(id_, count)
+            if self.holds[kind]:
+                raise BadRequest(f"{kind} are held already")
+            self.holds[kind] = Hold(id_, count)
         return {"held": 0}
 
-    def release_commits(self, conn, req):
-        """Test hook: apply the held commits, or with drop, answer them 503
-        without applying them, as if they had never arrived."""
+    def release(self, kind, req):
+        """Test hook: let the held commits or queries go on, or with drop,
+        answer them 503 instead, without applying a commit, as if it had
+        never arrived."""
         with self.lock:
-            hold, self.hold = self.hold, None
+            hold, self.holds[kind] = self.holds[kind], None
         if not hold:
             return {"released": 0}
         hold.drop = bool(req.get("drop"))
@@ -355,9 +376,10 @@ class Store:
 
     def stats(self, conn, req):
         """Test hook: how many requests each endpoint has served, and how
-        many commits are held."""
+        many commits and queries are held."""
         with self.lock:
-            return {"requests": dict(self.requests), "held": self.hold.waiting if self.hold else 0}
+            held = {kind: hold.waiting if hold else 0 for kind, hold in self.holds.items()}
+            return {"requests": dict(self.requests), "held": held["commits"], "held_queries": held["queries"]}
 
     def count(self, endpoint):
         with self.lock:
@@ -425,8 +447,9 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/v1/query": store.query, "/v1/commit": store.commit}
         if self.server.test_hooks:
             routes["/v1/test/fail-commits"] = store.fail_commits
-            routes["/v1/test/hold-commits"] = store.hold_commits
-            routes["/v1/test/release-commits"] = store.release_commits
+            for kind in store.holds:
+                routes[f"/v1/test/hold-{kind}"] = lambda conn, req, kind=kind: store.hold(kind, req)
+                routes[f"/v1/test/release-{kind}"] = lambda conn, req, kind=kind: store.release(kind, req)
             routes["/v1/test/stats"] = store.stats
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.path not in routes:
