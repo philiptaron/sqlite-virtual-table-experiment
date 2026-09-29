@@ -309,7 +309,7 @@ in
     # so whatever touches NFS waits, but its builder waits on a local file
     # and carries on. Once nfsd's lease runs out, another client takes the
     # output lock. Then client1 comes back, and each builder finishes in
-    # turn. What each build does is printed rather than checked, for now.
+    # turn. Nix never learns that client1 lost the lock.
 
     with subtest("a client cut off mid-build, while another builds the same derivation"):
         client1.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
@@ -321,15 +321,20 @@ in
         client2.wait_until_succeeds("ls -d /var/lib/nixremote/builds/nix-*/build", timeout=300)
         print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - start:.0f}s")
         reconnect(client1)
-        report(client1, "cutoff", *let_build_finish(client1, "cutoff"))
-        report(client2, "cutoff", *let_build_finish(client2, "cutoff"))
+        # client2 deleted client1's chroot to make its own, so client1's
+        # builder fails. Cleaning up, client1 deletes the chroot by its
+        # path, which is client2's now, so client2's builder fails too.
+        for m in (client1, client2):
+            rc, err = let_build_finish(m, "cutoff")
+            report(m, "cutoff", rc, err)
+            assert rc != "0" and "Stale file handle" in err, f"{m.name}'s build of nixremote-cutoff should have lost its chroot"
         client3.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
         rc, err = let_build_finish(client3, "cutoff")
         report(client3, "cutoff", rc, err)
         assert rc == "0", "client3 couldn't build nixremote-cutoff after client1 and client2"
         [cutoff] = client3.succeed("cat /tmp/cutoff.out").split()
         for m in clients:
-            print(f"{m.name} reads {m.succeed(f'cat /shared{cutoff}')!r} from {cutoff}")
+            m.succeed(f"nix-store --store '{store}' --verify-path {cutoff}")
 
     with subtest("a client cut off mid-build, while another substitutes its output"):
         # client3 fills the binary cache from a build in a store of its own.
@@ -355,12 +360,20 @@ in
         print(f"with client1 cut off, client2 substituted nixremote-substituted after {time.monotonic() - start:.0f}s")
         assert rc == "0" and built(err) == [], "client2 should have substituted nixremote-substituted, not built it"
         reconnect(client1)
-        report(client1, "substituted", *let_build_finish(client1, "substituted"))
-        print(f"the cache holds {cached!r}")
+        # client1's chroot is intact, so its build finishes. Registering
+        # its output, Nix finds the path valid, which it expects only of
+        # CA derivations, and aborts on assert(newInfo.ca). Otherwise it
+        # would have moved its own output over the one client2 substituted.
+        rc, err = let_build_finish(client1, "substituted")
+        report(client1, "substituted", rc, err)
+        assert rc == "134", f"client1's nix-build should have aborted, not exited {rc}"
         for m in clients:
-            print(f"{m.name} reads {m.succeed(f'cat /shared{substituted}')!r} from {substituted}")
-            status, out = m.execute(f"nix-store --store '{store}' --verify-path {substituted} 2>&1")
-            print(f"{m.name}: --verify-path exited {status}: {out.strip()}")
+            got = m.succeed(f"cat /shared{substituted}")
+            assert got == cached, f"{m.name} reads {got!r} from {substituted}, not the cache's {cached!r}"
+            m.succeed(f"nix-store --store '{store}' --verify-path {substituted}")
+        # Aborting, client1 left its chroot behind, and nothing else will
+        # delete it: the path is valid, so no one builds it again.
+        client3.succeed("rm -r /shared/nix/store/*-nixremote-substituted.drv.chroot")
 
     with subtest("in the end, every client agrees on the store's contents"):
         paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted}"

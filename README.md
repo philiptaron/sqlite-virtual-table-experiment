@@ -93,10 +93,11 @@ from a single long-lived connection.
 
 `test/nfs-cluster.nix` is a NixOS test with three client VMs. The servers
 run outside the VMs, on the machine running the test: an NFS export holds
-the store's files and `nixremote-server` holds its metadata. The VMs reach
-both at `10.0.2.2`, which is where QEMU's user-mode network puts the
-host's loopback. Each client mounts the export at `/shared` and uses the
-store `local?root=/shared&state=/var/lib/nixremote`. Then:
+the store's files, `nixremote-server` holds its metadata, and a second
+export holds a binary cache. The VMs reach them at `10.0.2.2`, which is
+where QEMU's user-mode network puts the host's loopback. Each client
+mounts the store's export at `/shared` and the cache at `/cache`, and
+uses the store `local?root=/shared&state=/var/lib/nixremote`. Then:
 
 - one client copies busybox in, and every client sees it as valid;
 - all three build the same derivation at the same time. Its output lock
@@ -107,7 +108,9 @@ store `local?root=/shared&state=/var/lib/nixremote`. Then:
 - every client agrees on the closure and verifies the store's contents;
 - client1 crashes partway through a build, and again partway through
   registering a path, both before and after its commit reaches the
-  service (see below).
+  service (see below);
+- client1 is cut off from the host partway through a build, while
+  another client builds or substitutes the same output (see below).
 
 ### Delegations: set `nfsv4.delegation_watermark=0` on every host
 
@@ -138,7 +141,7 @@ its defaults.
 nfsd has no per-export or write-only switch for delegations. The one
 server-side alternative is `sysctl fs.leases-enable=0`, which stops
 delegations of every kind for the whole host. It also took 2.5 seconds,
-and suits a server that does nothing else. The test's last subtest fails
+and suits a server that does nothing else. One of the test's subtests fails
 if any client's failed OPENs reach 100, which is how a writer keeping its
 delegations shows up. The trace step shows the details: NFS4ERR_DELAY and
 recalls per connection, and each client's delegations sampled once a
@@ -202,8 +205,48 @@ Two things follow:
   finds.
 - A shorter lease (`lease-time` in `/etc/nfs.conf`, 10 seconds at least)
   shortens the wait. It also means a host cut off from the server for
-  longer than that loses its locks while it may still be building. That
-  case isn't tested yet.
+  longer than that loses its locks while it may still be building, which
+  goes wrong in the ways below.
+
+### A host that's cut off
+
+A host that loses the network doesn't crash, and it keeps building. Its
+NFS mount is `hard`, so anything that touches NFS waits for the network
+to come back, but its build directory is local. After the lease, nfsd
+gives its locks to the next host that asks. When the network comes back,
+its NFS client reopens by file handle the files that still exist, and
+marks the lock lost (`recover_lost_locks` is off). Nix never touches its
+lock file during a build, so it never learns that the lock is gone.
+
+The test cuts client1 off (iptables drops everything to and from the
+host) while it builds a derivation that waits for a local file partway
+through, and lets each build carry on in turn. Every build of these
+writes a random last line, so it's plain whose output ended up where.
+
+- **Another host builds the same derivation.** client2 gets the lock
+  after 106 seconds and deletes client1's chroot to make its own. When
+  client1 comes back, its builder fails (`Stale file handle`). Cleaning
+  up, client1 deletes `<drv>.chroot` by its path, which is client2's
+  chroot now, so client2's builder fails the same way. client3 then
+  builds it. Two builds are lost, and nothing is corrupted.
+- **Another host substitutes the output.** client2 gets the path from the
+  binary cache after 104 seconds; substituting needs no chroot, so
+  client1's survives. When client1 comes back, its build finishes. Nix
+  goes to register the output, finds it valid, which it expects only of
+  CA derivations, and aborts on `assert(newInfo.ca)`
+  (`derivation-builder.cc`). That assertion is all that stops it moving
+  its own output over the one client2 substituted. The abort skips
+  cleanup, so client1's chroot stays on the export for good: the path is
+  valid, so no one will build it again. The test deletes it.
+
+Neither case corrupted the store, but that rests on timing and on an
+assertion. If client1 finishes after client2 has put the substituted
+files in place but before client2's commit, it finds the path invalid,
+deletes client2's files, moves its own in, and registers them. client2's
+commit then fails with 409, and on the retry Nix updates the row, which
+the service allows. Whichever commit lands last sets the hash, and if
+the build isn't reproducible, the path's contents no longer match it.
+That window isn't tested yet.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
@@ -237,5 +280,7 @@ test/ci-host.sh verify
 - On NFS, only what the cluster test exercises is known to work: build
   locks across hosts, reading what another host wrote, with
   `delegation_watermark=0` on the hosts, and carrying on after a host
-  crashes (see above). A host cut off from the NFS server or the service
-  without crashing, and either server restarting, are still ahead.
+  crashes (see above). A host that's cut off can still overwrite a path
+  another host registered (see above), and nothing stops it: the
+  service can't tell whether a host still holds the path's lock. Either
+  server restarting is still ahead.
