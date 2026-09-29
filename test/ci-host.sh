@@ -4,21 +4,26 @@
 # and nixremote-server for its metadata, both on the host's loopback, where
 # the test's VMs reach them at 10.0.2.2.
 #
-#   test/ci-host.sh start    install and start both servers
-#   test/ci-host.sh verify   check the host's view after the test
-#   test/ci-host.sh logs     print the metadata service's log and the
-#                            kernel's
+#   test/ci-host.sh start      install and start both servers, and start
+#                              recording NFS traffic and nfsd's state
+#   test/ci-host.sh verify     check the host's view after the test
+#   test/ci-host.sh logs       print the metadata service's log and the
+#                              kernel's
+#   test/ci-host.sh nfs-trace  stop recording and summarize it; the whole
+#                              capture stays in /tmp/nixremote-host
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export_dir=/srv/nixremote
 work=/tmp/nixremote-host
 db=$work/meta.sqlite
+pcap=$work/nfs.pcap
 
 case ${1:-} in
   start)
     sudo apt-get update -q
-    sudo apt-get install -yq --no-install-recommends nfs-kernel-server sqlite3
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+      nfs-kernel-server sqlite3 tcpdump tshark
     sudo mkdir -p "$export_dir"
     # QEMU's user-mode network makes every guest connection come from the
     # host's loopback, from an unprivileged port: hence insecure. Nix runs
@@ -27,13 +32,15 @@ case ${1:-} in
     # 10.0.2.2:/.
     echo "$export_dir 127.0.0.1(rw,sync,insecure,no_root_squash,no_subtree_check,fsid=0)" |
       sudo tee /etc/exports >/dev/null
-    # EXPERIMENT: does client2's 90 second stall go away without
-    # delegations? nfsd grants none while leases are off.
-    sudo sysctl fs.leases-enable=0
     sudo systemctl restart nfs-kernel-server
     sudo exportfs -v
 
     mkdir -p "$work"
+    # Every NFS packet both ways, callbacks included: they share the
+    # clients' connections (the NFSv4.1 backchannel).
+    sudo nohup tcpdump -i lo -s 0 -U -w "$pcap" tcp port 2049 >"$work/tcpdump.log" 2>&1 &
+    sudo nohup test/nfsd-states >"$work/nfsd-states.log" 2>&1 &
+
     nohup python3 server/nixremote-server --db "$db" --listen 127.0.0.1:8080 -v \
       >"$work/server.log" 2>&1 &
     echo $! >"$work/server.pid"
@@ -70,8 +77,34 @@ case ${1:-} in
     sudo dmesg --ctime | tail -n 100
     ;;
 
+  nfs-trace)
+    sudo pkill -INT -x tcpdump || true
+    sudo pkill -f test/nfsd-states || true
+    sleep 1
+    sudo chmod a+r "$pcap"
+    trace() { tshark -r "$pcap" -n -T fields -e frame.time -e tcp.stream "$@" 2>&1; }
+
+    echo "# nfsd's clients and the state each holds, whenever that changes"
+    awk '{ k = $2 " " $3; v = substr($0, length($1) + 2); if (last[k] != v) print; last[k] = v }' \
+      "$work/nfsd-states.log"
+
+    echo "# connections in the capture: time, tcp.stream, client port"
+    trace -Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0' -e tcp.srcport
+
+    echo "# callbacks: the server's calls to clients, and their replies"
+    trace -Y '(tcp.srcport == 2049 && rpc.msgtyp == 0) || (tcp.dstport == 2049 && rpc.msgtyp == 1)' -e _ws.col.Info
+
+    echo "# NFS errors other than NOENT"
+    trace -Y 'nfs.nfsstat4 && nfs.nfsstat4 != 0 && nfs.nfsstat4 != 2' -e _ws.col.Info
+
+    echo "# pauses of over 5 seconds on a connection, and what ended them"
+    tshark -r "$pcap" -n -Y rpc -T fields -e frame.time_epoch -e tcp.stream -e _ws.col.Info 2>&1 |
+      awk -F'\t' '{ if ($2 in last && $1 - last[$2] > 5) printf "stream %s quiet for %.1fs, then %s\n", $2, $1 - last[$2], $3
+                    last[$2] = $1 }'
+    ;;
+
   *)
-    echo "usage: $0 start|verify|logs" >&2
+    echo "usage: $0 start|verify|logs|nfs-trace" >&2
     exit 2
     ;;
 esac
