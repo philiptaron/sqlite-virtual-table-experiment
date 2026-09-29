@@ -104,7 +104,10 @@ store `local?root=/shared&state=/var/lib/nixremote`. Then:
   then find it valid;
 - one client builds a derivation over every client's output without
   rebuilding any of them;
-- every client agrees on the closure and verifies the store's contents.
+- every client agrees on the closure and verifies the store's contents;
+- client1 crashes partway through a build, and again partway through
+  registering a path, both before and after its commit reaches the
+  service (see below).
 
 ### Delegations: set `nfsv4.delegation_watermark=0` on every host
 
@@ -141,6 +144,47 @@ delegations shows up. The trace step shows the details: NFS4ERR_DELAY and
 recalls per connection, and each client's delegations sampled once a
 second.
 
+### A host that crashes
+
+The other hosts carry on correctly, but anything the dead host was
+writing is stuck for about 105 seconds. The test crashes client1 three
+times (QEMU quits without syncing), and boots it again after each:
+
+- **Mid-build.** Nix builds in a chroot next to the derivation, on NFS,
+  and moves the output into place only once the build succeeds. So
+  client1 leaves half an output in `<drv>.chroot`, nothing at the output
+  path, and nothing registered. client2 and client3 then build the same
+  derivation. One of them builds it, deleting the old chroot first, and
+  the other finds it valid. That took 125 seconds, 20 of them building.
+- **Files copied, commit never arrived.** The service holds client1's
+  commit, and drops it after the crash (`--test-hooks`). The files stay
+  on the export, unregistered. client2 copies the same path 104 seconds
+  later: Nix takes the path's lock, finds the path invalid, deletes the
+  files, and copies it again.
+- **Commit arrived, client1 never heard back.** The service applies it
+  after the crash. The path's contents verify on every host: Nix closes
+  every file before registering the path, and an NFS client writes a file
+  back when it's closed.
+
+The wait is nfsd's lease. The dead host held its Nix lock file open, and
+with it a write delegation, which `delegation_watermark=0` returns only
+on close. Every other host's OPEN of that lock file gets NFS4ERR_DELAY
+while nfsd tries to recall the delegation from a host that can't answer.
+The retries back off to one every 15 seconds (`NFS4_POLL_RETRY_MAX`).
+After 90 seconds (the lease), nfsd drops the dead host's state, lock
+included, and the next retry succeeds.
+
+Two things follow:
+
+- Files a dead host left behind are cleaned up only when another host
+  builds or adds the same path. Nothing else deletes them, since hosts
+  can't delete (`deletes=deny`). `test/ci-host.sh verify` fails on any it
+  finds.
+- A shorter lease (`lease-time` in `/etc/nfs.conf`, 10 seconds at least)
+  shortens the wait. It also means a host cut off from the server for
+  longer than that loses its locks while it may still be building. That
+  case isn't tested yet.
+
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
 back to emulation. To see the host's servers it sets `__noChroot`, which
@@ -171,6 +215,7 @@ test/ci-host.sh verify
   enabled, Nix fails to open the store rather than keep that table locally
   on one host.
 - On NFS, only what the cluster test exercises is known to work: build
-  locks across hosts and reading what another host wrote, with
-  `delegation_watermark=0` on the hosts (see above). Client caching and
-  write ordering under failures are still ahead.
+  locks across hosts, reading what another host wrote, with
+  `delegation_watermark=0` on the hosts, and carrying on after a host
+  crashes (see above). A host cut off from the NFS server or the service
+  without crashing, and either server restarting, are still ahead.
