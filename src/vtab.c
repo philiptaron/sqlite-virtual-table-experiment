@@ -60,6 +60,21 @@ static int backend_fail(nr_vtab *vt, int rc) {
   return fail(vt, rc, "nixremote: %s", nr_backend_errmsg(vt->conn->backend));
 }
 
+/*
+ * Refuse to say that path is invalid, or to register it, once this process
+ * has lost its lock on the path. Nix asks whether an output is valid right
+ * before it deletes whatever is at the output path and moves its own build
+ * there, and a host that lost the lock may be about to delete another
+ * host's files that way. SQLITE_IOERR isn't one Nix retries.
+ */
+static int fence(nr_vtab *vt, const char *path) {
+  if (!nr_lock_lost(path))
+    return SQLITE_OK;
+  return fail(vt, SQLITE_IOERR,
+              "nixremote: this process lost its lock on %s.lock, so another host may be "
+              "building or adding %s; refusing to act on it", path, path);
+}
+
 /* Split a module argument like  backend='file:/x'  into key and unquoted value. */
 static int parse_arg(const char *arg, char **key, char **value) {
   const char *eq = strchr(arg, '=');
@@ -248,7 +263,11 @@ static int xFilter(sqlite3_vtab_cursor *c, int idxNum, const char *idxStr, int a
     cur->eof = 1;
     return backend_fail(vt, rc);
   }
-  return xNext(c);
+  rc = xNext(c);
+  if (rc == SQLITE_OK && cur->eof && vt->table == &nr_valid_paths && (idxNum & 3) == NR_EQ &&
+      idxNum >> 2 == 1)
+    rc = fence(vt, (const char *)sqlite3_value_text(argv[0]));
+  return rc;
 }
 
 static int xEof(sqlite3_vtab_cursor *c) {
@@ -283,6 +302,8 @@ static int xUpdate(sqlite3_vtab *p, int argc, sqlite3_value **argv, sqlite3_int6
     if (t->rowid_col >= 0 && (sqlite3_value_type(argv[1]) != SQLITE_NULL ||
                               sqlite3_value_type(argv[2 + t->rowid_col]) != SQLITE_NULL))
       return fail(vt, SQLITE_CONSTRAINT, "nixremote: %s ids are derived from the store path and cannot be given", t->name);
+    if (t == &nr_valid_paths && (rc = fence(vt, (const char *)sqlite3_value_text(argv[3]))) != SQLITE_OK)
+      return rc;
     rc = nr_insert(b, t, argv + 2, rowid);
     /* Another host registered the path between Nix's isValidPath check and
        this insert. Nix retries on SQLITE_BUSY, and on the retry it will
@@ -296,6 +317,8 @@ static int xUpdate(sqlite3_vtab *p, int argc, sqlite3_value **argv, sqlite3_int6
     if (sqlite3_value_int64(argv[0]) != sqlite3_value_int64(argv[1]) ||
         sqlite3_value_int64(argv[0]) != nr_path_id((const char *)sqlite3_value_text(argv[3])))
       return fail(vt, SQLITE_CONSTRAINT, "nixremote: a store path's id and path cannot change");
+    if ((rc = fence(vt, (const char *)sqlite3_value_text(argv[3]))) != SQLITE_OK)
+      return rc;
     rc = nr_update(b, t, sqlite3_value_int64(argv[0]), argv + 2);
   }
   return rc == SQLITE_OK ? SQLITE_OK : backend_fail(vt, rc);

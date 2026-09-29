@@ -126,4 +126,11 @@ static inline int nr_rollback(nr_backend *b) { return b->ops->rollback(b); }
  */
 sqlite3_int64 nr_path_id(const char *path);
 
+/*
+ * Whether this process held a lock on path's lock file (path + ".lock") on
+ * NFS, and the NFS client has since found it lost (src/lock.c). Always 0
+ * off Linux.
+ */
+int nr_lock_lost(const char *path);
+
 #endif
