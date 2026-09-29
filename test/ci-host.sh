@@ -41,7 +41,8 @@ case ${1:-} in
     sudo nohup tcpdump -i lo -s 0 -U -w "$pcap" tcp port 2049 >"$work/tcpdump.log" 2>&1 &
     sudo nohup test/nfsd-states >"$work/nfsd-states.log" 2>&1 &
 
-    nohup python3 server/nixremote-server --db "$db" --listen 127.0.0.1:8080 -v \
+    # --test-hooks: the test holds commits to crash a client mid-commit.
+    nohup python3 server/nixremote-server --db "$db" --listen 127.0.0.1:8080 -v --test-hooks \
       >"$work/server.log" 2>&1 &
     echo $! >"$work/server.pid"
     for _ in $(seq 50); do
@@ -65,7 +66,7 @@ case ${1:-} in
     fi
     echo "$(wc -l <<<"$registered") store paths, each registered with the service and present on the export:"
     echo "$registered"
-    for name in shared client1 client2 client3 combined; do
+    for name in shared client1 client2 client3 combined interrupted dropped applied; do
       grep -q -- "-nixremote-$name\$" <<<"$registered" || { echo "no nixremote-$name output"; exit 1; }
     done
     ;;

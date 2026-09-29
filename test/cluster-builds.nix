@@ -35,4 +35,8 @@ in
   # Built from every client's output, on one client, without rebuilding any
   # of them.
   combined = mk "nixremote-combined" "cat ${toString (map own clients)} > $out";
+  # The test crashes the client building this once it has written half of
+  # its output. Another client then has to take over the output lock from
+  # a host that will never release it, and build it again.
+  interrupted = mk "nixremote-interrupted" "echo started > $out; sleep 20; echo finished >> $out";
 }
