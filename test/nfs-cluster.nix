@@ -343,8 +343,12 @@ in
         cut_off_mid_build(client1, "cutoff")
         start = time.monotonic()
         client2.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
-        # client2's build directory appears once it has the output lock.
+        # client2's build directory appears once it has the output lock, and
+        # its builder runs once it has made its chroot. Reconnecting client1
+        # before then would have it delete the chroot while client2 is still
+        # setting it up.
         client2.wait_until_succeeds("ls -d /var/lib/nixremote/builds/nix-*/build", timeout=300)
+        client2.wait_until_succeeds("pgrep -f 'do sleep 0.2'", timeout=60)
         print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - start:.0f}s")
         reconnect(client1)
         # client2 deleted client1's chroot to make its own, so client1's
