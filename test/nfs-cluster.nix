@@ -18,6 +18,16 @@ let
     "client2"
     "client3"
   ];
+  # Store paths without references for a client to copy in and crash while
+  # committing: 20 files of 1MB each.
+  payload =
+    name:
+    pkgs.runCommand "nixremote-${name}" { } ''
+      mkdir $out
+      for i in $(seq 20); do yes ${name} $i | head -c 1000000 > $out/$i; done
+    '';
+  dropped = payload "dropped";
+  applied = payload "applied";
 
   client =
     { config, pkgs, ... }:
@@ -69,6 +79,10 @@ let
         pkgs.curl
         pkgs.sqlite
       ];
+      virtualisation.additionalPaths = [
+        dropped
+        applied
+      ];
     };
 in
 (pkgs.testers.runNixOSTest {
@@ -77,18 +91,22 @@ in
   nodes = pkgs.lib.genAttrs clients (_: client);
 
   testScript = ''
+    import json
     import re
+    import time
 
     store = "${store}"
     busybox = "${pkgs.busybox}"
+    dropped = "${dropped}"
+    applied = "${applied}"
     clients = [${toString (map (c: "${c},") clients)}]
 
-    def build_everywhere(round, args):
+    def build_everywhere(round, args, machines=clients):
         """Start the same build on every client at once, wait for all of
         them, and return each one's (output paths, stderr)."""
-        for m in clients:
+        for m in machines:
             m.succeed(f"systemd-run --unit={round} --collect /run/current-system/sw/bin/cluster-build {round} {args}")
-        return {m.name: finished(m, round) for m in clients}
+        return {m.name: finished(m, round) for m in machines}
 
     def finished(m, round):
         m.wait_until_succeeds(f"test -e /tmp/{round}.rc", timeout=900)
@@ -100,6 +118,31 @@ in
     def built(err):
         """The names of the derivations a nix-build actually built."""
         return re.findall(r"^building '/nix/store/[a-z0-9]+-([^']+)\.drv'", err, re.M)
+
+    def mount_shared(m):
+        m.succeed("mkdir -p /shared && mount -t nfs4 -o vers=4.2 ${host}:/ /shared")
+
+    def hook(name, body="{}"):
+        """Call one of the metadata service's test hooks, from client3,
+        which never crashes."""
+        return json.loads(client3.succeed(f"curl -sf -H 'Content-Type: application/json' -d '{body}' ${backend}/v1/test/{name}"))
+
+    def crash_while_committing(m, path, drop):
+        """Have m copy path into the store, and crash it once the service
+        has its commit. Then apply the commit, or drop it as if it had never
+        arrived."""
+        hook("hold-commits")
+        m.succeed(f"systemd-run --unit=copy --collect /run/current-system/sw/bin/nix copy --no-check-sigs --to '{store}' {path}")
+        client3.wait_until_succeeds("curl -sf -d '{}' ${backend}/v1/test/stats | grep -q '\"held\": 1'", timeout=120)
+        m.crash()
+        released = hook("release-commits", json.dumps({"drop": drop}))
+        assert released == {"released": 1}, f"released {released}, want the one commit {m.name} sent"
+
+    def restart(m):
+        """Boot m again after a crash, with the store mounted again."""
+        m.start()
+        m.wait_for_unit("multi-user.target")
+        mount_shared(m)
 
     def notable_nfs_ops(m):
         """The NFS operations on /shared that m has spent over a second on
@@ -127,7 +170,7 @@ in
     with subtest("every client mounts the host's store and uses its metadata service"):
         for m in clients:
             m.succeed("curl -sf ${backend}/v1/health")
-            m.succeed("mkdir -p /shared && mount -t nfs4 -o vers=4.2 ${host}:/ /shared")
+            mount_shared(m)
             watermark = m.succeed("cat /sys/module/nfsv4/parameters/delegation_watermark").strip()
             assert watermark == "0", f"{m.name} has delegation_watermark={watermark}, want 0"
             m.succeed("nixremote-mkstate /var/lib/nixremote ${backend}")
@@ -177,6 +220,68 @@ in
             print(f"{m.name}: NFS operations over a second or with errors (count, ms, errors): {ops or 'none'}")
             failed_opens = sum(ops.get(op, (0, 0, 0))[2] for op in ("OPEN", "OPEN_NOATTR"))
             assert failed_opens < 100, f"{m.name} failed {failed_opens} OPENs; is a writer keeping its delegations?"
+
+    # The rest crash client1 and boot it again, so they come after
+    # everything that reads its NFS statistics.
+
+    with subtest("a build whose client crashes is built again by another client"):
+        # client1 dies holding the output lock, a lock on NFS that nothing
+        # will release until the NFS server gives up on client1. It leaves
+        # half of the output in the build's chroot, which is next to the
+        # derivation on NFS; the output moves into place only when the build
+        # is done, and is registered after that.
+        chroot = "/shared/nix/store/*-nixremote-interrupted.drv.chroot"
+        client1.succeed("systemd-run --unit=interrupted --collect /run/current-system/sw/bin/cluster-build interrupted -A interrupted")
+        client1.wait_until_succeeds(f"grep -qx started {chroot}/root/nix/store/*-nixremote-interrupted", timeout=120)
+        client1.crash()
+        start = time.monotonic()
+        results = build_everywhere("resumed", "-A interrupted", [client2, client3])
+        print(f"with client1 down, client2 and client3 built nixremote-interrupted in {time.monotonic() - start:.0f}s")
+        outs = {out[0] for out, _ in results.values()}
+        assert len(outs) == 1, f"clients disagree on nixremote-interrupted: {outs}"
+        [interrupted] = outs
+        builders = [name for name, (_, err) in results.items() if "nixremote-interrupted" in built(err)]
+        assert len(builders) == 1, f"nixremote-interrupted was built by {builders}, want exactly one client"
+        for m in (client2, client3):
+            got = m.succeed(f"cat /shared{interrupted}")
+            assert got == "started\nfinished\n", f"{m.name} reads {got!r} from {interrupted}"
+        # Whoever builds a derivation deletes its old chroot first.
+        client2.fail(f"ls -d {chroot}")
+
+    with subtest("the crashed client comes back and sees what the others built"):
+        restart(client1)
+        client1.succeed(f"nix-store --store '{store}' --verify-path {interrupted}")
+        client1.succeed("/run/current-system/sw/bin/cluster-build rebooted -A combined -A interrupted")
+        _, err = finished(client1, "rebooted")
+        assert built(err) == [], f"client1 rebuilt {built(err)} after its crash"
+
+    with subtest("files a client wrote but crashed before registering are replaced"):
+        crash_while_committing(client1, dropped, drop=True)
+        # Nothing refers to them, and nothing will delete them: deletes=deny.
+        client2.succeed(f"test -s /shared{dropped}/20")
+        client2.fail(f"nix path-info --store '{store}' {dropped}")
+        # client1 died holding the path's lock too.
+        start = time.monotonic()
+        client2.succeed(f"nix copy --no-check-sigs --to '{store}' {dropped}")
+        print(f"with client1 down, client2 copied nixremote-dropped in {time.monotonic() - start:.0f}s")
+        client3.succeed(f"nix-store --store '{store}' --verify-path {dropped}")
+        restart(client1)
+
+    with subtest("a commit applied after its client crashed registers complete files"):
+        # The service had the whole request; client1 never hears the answer.
+        # Nix closes every file before registering the path, and NFS writes
+        # a file back on close, so its contents are on the server already.
+        crash_while_committing(client1, applied, drop=False)
+        for m in (client2, client3):
+            m.succeed(f"nix-store --store '{store}' --verify-path {applied}")
+        restart(client1)
+        client1.succeed(f"nix-store --store '{store}' --verify-path {applied}")
+
+    with subtest("after the crashes, every client agrees on the store's contents"):
+        closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {combined} {interrupted} {dropped} {applied}") for m in clients}
+        assert len(set(closures.values())) == 1, f"clients disagree after the crashes: {closures}"
+        for m in clients:
+            m.succeed(f"nix-store --store '{store}' --verify --check-contents")
   '';
 }).overrideTestDerivation
   (_: {
