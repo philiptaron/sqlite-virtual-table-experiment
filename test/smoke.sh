@@ -173,6 +173,22 @@ if [[ $backend == http* ]]; then
     sed 's/^/     /' "$work/retry.err"
   fi
 
+  echo "# a registered path's hash can't change, but the rest of its row can"
+  p=$(head -n1 <<<"$closure")
+  row() { sqlite3 "$work/remote.sqlite" "select $1 from ValidPaths where path = '$p'"; }
+  update() {
+    sqlite3 "$work/b/db/db.sqlite" 2>&1 <<SQL
+.load $lib sqlite3_nixremote_init
+update ValidPaths set $1 where path = '$p';
+SQL
+  }
+  hash=$(row hash)
+  update "hash = 'sha256:$(printf '1%.0s' {1..64})'" >"$work/rehash.out" || true
+  grep -q 'is registered with hash' "$work/rehash.out" && [[ $(row hash) == "$hash" ]] &&
+    ok "changing a path's hash is refused" || { not_ok "changing a path's hash"; sed 's/^/     /' "$work/rehash.out"; }
+  update "sigs = 'smoke:sig'" >"$work/resign.out" && [[ $(row sigs) == smoke:sig ]] &&
+    ok "changing its signatures isn't" || { not_ok "changing a path's signatures"; sed 's/^/     /' "$work/resign.out"; }
+
   echo "# caching, seen from one long-lived connection on host a"
   rc=0
   python3 test/cache.py "$lib" "$work/a/db/db.sqlite" "$backend" "$b" "$top" $(nix-store -q --references "$top") >"$work/cache.out" 2>&1 || rc=$?

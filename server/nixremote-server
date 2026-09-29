@@ -12,6 +12,10 @@ Conflicts with other hosts are reported as HTTP 409, which hosts turn into
 SQLITE_BUSY so that Nix retries the transaction. Nix re-checks what it
 relies on (that a reference is valid, that a path has no referrers) on
 every attempt, so a retry either succeeds or fails with Nix's own error.
+A registered path's hash never changes, though: a host that finds a path
+valid updates its row rather than registering it, and a commit that would
+change the hash that way is refused (422). Otherwise a host whose files
+were replaced after it wrote them would set their hash from its own.
 
 Hosts cache what stays true while a path is valid: its row, references,
 and derivation outputs. Every response carries an epoch that goes up
@@ -92,6 +96,9 @@ TABLES = {
 OPERATORS = {"eq": "=", "ge": ">=", "gt": ">"}
 MAX_LIMIT = 10000
 NIX_BASE32 = "0123456789abcdfghijklmnpqrsvwxyz"
+# What Nix registers for a path whose hash it doesn't know, and fills in
+# when it verifies the path.
+NULL_HASH = "sha256:" + "0" * 64
 
 
 def path_id(path):
@@ -384,6 +391,14 @@ class Store:
             id_ = op.get("id")
             if path_id(values[1]) != id_:
                 raise Invalid("a store path's id and path cannot change")
+            if name == "ValidPaths":
+                # A host that registers a path it finds valid updates its
+                # row, whether or not its files are the ones registered:
+                # say, a host that lost the path's lock, whose files another
+                # host has since replaced. Keep the hash that was there.
+                row = conn.execute("select hash from ValidPaths where id = ?", (id_,)).fetchone()
+                if row and row[0] not in (values[2], NULL_HASH):
+                    raise Invalid(f"{values[1]} is registered with hash {row[0]}, not {values[2]}")
             sets = ", ".join(f"{c} = ?" for c in cols if c != key)
             cur = execute(conn, f"update {name} set {sets} where {key} = ?", values[1:] + [id_])
             if cur.rowcount == 0:
