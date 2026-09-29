@@ -144,18 +144,38 @@ delegations shows up. The trace step shows the details: NFS4ERR_DELAY and
 recalls per connection, and each client's delegations sampled once a
 second.
 
+### Where a build writes
+
+A sandboxed build's scratch space is local, and its outputs are on NFS
+from the start. In Nix 2.35:
+
+| In the sandbox | On the host | On NFS? |
+|---|---|---|
+| `/build`: `TMPDIR`, the working directory | `<state>/builds/nix-*/build`, so `/var/lib/nixremote/builds` | no |
+| each output, `/nix/store/<out>` | `/shared/nix/store/<drv>.chroot/root/nix/store/<out>` | yes |
+| the chroot's `/tmp` and `/etc` | also in `<drv>.chroot/root` | yes |
+| inputs | bind-mounted (directories) or hard-linked from the store | yes, read |
+
+The build directory is `build-dir`, which defaults to `builds` in the
+state directory, and the store URL's `state=` puts that on local disk.
+Unpacking and compiling never touch NFS, unless a builder writes to
+`/tmp` and ignores `TMPDIR`. Each output is written over NFS once, while
+it's being built, and then renamed into place on the same export. Nix
+puts the chroot next to the derivation so that this move is a rename;
+moving the chroot elsewhere would make it a copy.
+
 ### A host that crashes
 
 The other hosts carry on correctly, but anything the dead host was
 writing is stuck for about 105 seconds. The test crashes client1 three
 times (QEMU quits without syncing), and boots it again after each:
 
-- **Mid-build.** Nix builds in a chroot next to the derivation, on NFS,
-  and moves the output into place only once the build succeeds. So
-  client1 leaves half an output in `<drv>.chroot`, nothing at the output
-  path, and nothing registered. client2 and client3 then build the same
-  derivation. One of them builds it, deleting the old chroot first, and
-  the other finds it valid. That took 125 seconds, 20 of them building.
+- **Mid-build.** client1 leaves half an output in `<drv>.chroot` on the
+  export (see above), nothing at the output path, and nothing
+  registered. Its build directory stays on its own disk, where the test
+  doesn't look. client2 and client3 then build the same derivation. One
+  of them builds it, deleting the old chroot first, and the other finds
+  it valid. That took 125 seconds, 20 of them building.
 - **Files copied, commit never arrived.** The service holds client1's
   commit, and drops it after the crash (`--test-hooks`). The files stay
   on the export, unregistered. client2 copies the same path 104 seconds
