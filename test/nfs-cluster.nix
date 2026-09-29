@@ -1,5 +1,5 @@
 # Several NixOS VMs sharing one Nix store: the files on NFS, the metadata
-# in nixremote-server. Both servers run on the machine running the test,
+# in nixremote-server, and a binary cache on another NFS export. Both servers run on the machine running the test,
 # outside the VMs (test/ci-host.sh starts them); the VMs reach it at
 # 10.0.2.2, QEMU's user-mode network address for the host's loopback.
 #
@@ -34,12 +34,12 @@ let
     let
       nix = config.nix.package;
       # cluster-build ROUND ARGS...: nix-build test/cluster-builds.nix in the
-      # shared store, leaving /tmp/ROUND.{out,err,rc}.
+      # shared store, or in $STORE, leaving /tmp/ROUND.{out,err,rc}.
       clusterBuild = pkgs.writeShellScriptBin "cluster-build" ''
         round=$1
         shift
         rc=0
-        ${nix}/bin/nix-build --store '${store}' ${./cluster-builds.nix} --no-out-link \
+        ${nix}/bin/nix-build --store "''${STORE:-${store}}" ${./cluster-builds.nix} --no-out-link \
           --argstr busybox ${pkgs.busybox} \
           --argstr client ${config.networking.hostName} \
           --arg clients '[ ${toString (map (c: ''"${c}"'') clients)} ]' \
@@ -77,6 +77,7 @@ let
         nixremote
         clusterBuild
         pkgs.curl
+        pkgs.iptables
         pkgs.sqlite
       ];
       virtualisation.additionalPaths = [
@@ -108,19 +109,46 @@ in
             m.succeed(f"systemd-run --unit={round} --collect /run/current-system/sw/bin/cluster-build {round} {args}")
         return {m.name: finished(m, round) for m in machines}
 
-    def finished(m, round):
+    def outcome(m, round):
+        """Wait for a cluster-build round to end, and return its exit code
+        and stderr."""
         m.wait_until_succeeds(f"test -e /tmp/{round}.rc", timeout=900)
-        err = m.succeed(f"cat /tmp/{round}.err")
-        rc = m.succeed(f"cat /tmp/{round}.rc").strip()
+        return m.succeed(f"cat /tmp/{round}.rc").strip(), m.succeed(f"cat /tmp/{round}.err")
+
+    def finished(m, round):
+        rc, err = outcome(m, round)
         assert rc == "0", f"{m.name}: nix-build exited {rc}:\n{err}"
         return m.succeed(f"cat /tmp/{round}.out").split(), err
+
+    def let_build_finish(m, round, state="/var/lib/nixremote"):
+        """Once m is running a build that waits for go (see
+        cluster-builds.nix), let it carry on; then wait for the round to
+        end, and return its exit code and stderr."""
+        builds = f"{state}/builds/nix-*/build"
+        m.wait_until_succeeds(f"test -e /tmp/{round}.rc || ls -d {builds}", timeout=900)
+        m.execute(f"for d in {builds}; do touch $d/go; done")
+        return outcome(m, round)
+
+    def report(m, round, rc, err):
+        tail = "\n".join(err.strip().splitlines()[-8:])
+        print(f"{m.name}'s {round} exited {rc}:\n{tail}")
 
     def built(err):
         """The names of the derivations a nix-build actually built."""
         return re.findall(r"^building '/nix/store/[a-z0-9]+-([^']+)\.drv'", err, re.M)
 
     def mount_shared(m):
-        m.succeed("mkdir -p /shared && mount -t nfs4 -o vers=4.2 ${host}:/ /shared")
+        m.succeed("mkdir -p /shared /cache")
+        m.succeed("mount -t nfs4 -o vers=4.2 ${host}:/srv/nixremote /shared")
+        m.succeed("mount -t nfs4 -o vers=4.2 ${host}:/srv/nixremote-cache /cache")
+
+    def cut_off(m):
+        """Drop everything between m and the host, both ways. m doesn't
+        crash: its NFS mount (hard) and the service just stop answering."""
+        m.succeed("iptables -w -I OUTPUT -d ${host} -j DROP && iptables -w -I INPUT -s ${host} -j DROP")
+
+    def reconnect(m):
+        m.succeed("iptables -w -D OUTPUT -d ${host} -j DROP && iptables -w -D INPUT -s ${host} -j DROP")
 
     def hook(name, body="{}"):
         """Call one of the metadata service's test hooks, from client3,
@@ -277,9 +305,67 @@ in
         restart(client1)
         client1.succeed(f"nix-store --store '{store}' --verify-path {applied}")
 
-    with subtest("after the crashes, every client agrees on the store's contents"):
-        closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {combined} {interrupted} {dropped} {applied}") for m in clients}
-        assert len(set(closures.values())) == 1, f"clients disagree after the crashes: {closures}"
+    # A client cut off from the host rather than crashed. Its mount is hard,
+    # so whatever touches NFS waits, but its builder waits on a local file
+    # and carries on. Once nfsd's lease runs out, another client takes the
+    # output lock. Then client1 comes back, and each builder finishes in
+    # turn. What each build does is printed rather than checked, for now.
+
+    with subtest("a client cut off mid-build, while another builds the same derivation"):
+        client1.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
+        client1.wait_until_succeeds("grep -qx started /shared/nix/store/*-nixremote-cutoff.drv.chroot/root/nix/store/*-nixremote-cutoff", timeout=120)
+        cut_off(client1)
+        start = time.monotonic()
+        client2.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
+        # client2's build directory appears once it has the output lock.
+        client2.wait_until_succeeds("ls -d /var/lib/nixremote/builds/nix-*/build", timeout=300)
+        print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - start:.0f}s")
+        reconnect(client1)
+        report(client1, "cutoff", *let_build_finish(client1, "cutoff"))
+        report(client2, "cutoff", *let_build_finish(client2, "cutoff"))
+        client3.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
+        rc, err = let_build_finish(client3, "cutoff")
+        report(client3, "cutoff", rc, err)
+        assert rc == "0", "client3 couldn't build nixremote-cutoff after client1 and client2"
+        [cutoff] = client3.succeed("cat /tmp/cutoff.out").split()
+        for m in clients:
+            print(f"{m.name} reads {m.succeed(f'cat /shared{cutoff}')!r} from {cutoff}")
+
+    with subtest("a client cut off mid-build, while another substitutes its output"):
+        # client3 fills the binary cache from a build in a store of its own.
+        fill = "/var/lib/cachefill"
+        client3.succeed(f"nix copy --no-check-sigs --to {fill} {busybox}")
+        client3.succeed(f"systemd-run --unit=fill --collect --setenv=STORE={fill} /run/current-system/sw/bin/cluster-build fill -A substituted")
+        rc, err = let_build_finish(client3, "fill", f"{fill}/nix/var/nix")
+        assert rc == "0", f"client3 couldn't fill the cache:\n{err}"
+        [substituted] = client3.succeed("cat /tmp/fill.out").split()
+        client3.succeed(f"nix copy --no-check-sigs --from {fill} --to file:///cache {substituted}")
+        cached = client3.succeed(f"cat {fill}{substituted}")
+
+        client1.succeed("systemd-run --unit=substituted --collect /run/current-system/sw/bin/cluster-build substituted -A substituted")
+        client1.wait_until_succeeds("grep -qx started /shared/nix/store/*-nixremote-substituted.drv.chroot/root/nix/store/*-nixremote-substituted", timeout=120)
+        cut_off(client1)
+        start = time.monotonic()
+        client2.succeed(
+            f"systemd-run --unit=substituted --collect '--setenv=STORE={store}&require-sigs=false' "
+            "/run/current-system/sw/bin/cluster-build substituted -A substituted --option substituters file:///cache"
+        )
+        rc, err = outcome(client2, "substituted")
+        report(client2, "substituted", rc, err)
+        print(f"with client1 cut off, client2 substituted nixremote-substituted after {time.monotonic() - start:.0f}s")
+        assert rc == "0" and built(err) == [], "client2 should have substituted nixremote-substituted, not built it"
+        reconnect(client1)
+        report(client1, "substituted", *let_build_finish(client1, "substituted"))
+        print(f"the cache holds {cached!r}")
+        for m in clients:
+            print(f"{m.name} reads {m.succeed(f'cat /shared{substituted}')!r} from {substituted}")
+            status, out = m.execute(f"nix-store --store '{store}' --verify-path {substituted} 2>&1")
+            print(f"{m.name}: --verify-path exited {status}: {out.strip()}")
+
+    with subtest("in the end, every client agrees on the store's contents"):
+        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted}"
+        closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
+        assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify --check-contents")
   '';

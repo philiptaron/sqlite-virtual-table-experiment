@@ -15,6 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export_dir=/srv/nixremote
+cache_dir=/srv/nixremote-cache
 work=/tmp/nixremote-host
 db=$work/meta.sqlite
 pcap=$work/nfs.pcap
@@ -24,14 +25,15 @@ case ${1:-} in
     sudo apt-get update -q
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
       nfs-kernel-server sqlite3 tcpdump tshark
-    sudo mkdir -p "$export_dir"
+    sudo mkdir -p "$export_dir" "$cache_dir"
     # QEMU's user-mode network makes every guest connection come from the
     # host's loopback, from an unprivileged port: hence insecure. Nix runs
     # as root on the clients and chowns what it builds: hence
-    # no_root_squash. fsid=0 makes this the NFSv4 root, so clients mount
-    # 10.0.2.2:/.
-    echo "$export_dir 127.0.0.1(rw,sync,insecure,no_root_squash,no_subtree_check,fsid=0)" |
-      sudo tee /etc/exports >/dev/null
+    # no_root_squash. The store's files are one export, and a binary cache
+    # (a file:// store) is another; clients mount each by its path.
+    for dir in "$export_dir" "$cache_dir"; do
+      echo "$dir 127.0.0.1(rw,sync,insecure,no_root_squash,no_subtree_check)"
+    done | sudo tee /etc/exports >/dev/null
     sudo systemctl restart nfs-kernel-server
     sudo exportfs -v
 
@@ -66,7 +68,7 @@ case ${1:-} in
     fi
     echo "$(wc -l <<<"$registered") store paths, each registered with the service and present on the export:"
     echo "$registered"
-    for name in shared client1 client2 client3 combined interrupted dropped applied; do
+    for name in shared client1 client2 client3 combined interrupted dropped applied cutoff substituted; do
       grep -q -- "-nixremote-$name\$" <<<"$registered" || { echo "no nixremote-$name output"; exit 1; }
     done
     ;;
