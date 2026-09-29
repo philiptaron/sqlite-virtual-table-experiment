@@ -95,6 +95,19 @@ in
         """The names of the derivations a nix-build actually built."""
         return re.findall(r"^building '/nix/store/[a-z0-9]+-([^']+)\.drv'", err, re.M)
 
+    def slow_nfs_ops(m):
+        """The NFS operations on /shared that m has spent over a second on,
+        in total, as {op: (count, milliseconds)}."""
+        [stats] = [d for d in m.succeed("cat /proc/self/mountstats").split("device ") if " mounted on /shared " in d]
+        ops = {}
+        # ops, transmissions, timeouts, bytes sent, bytes received, then
+        # milliseconds queued, in flight, and in total (then errors).
+        for op, fields in re.findall(r"^\s+([A-Z_]+): (\d+(?: \d+){7,})$", stats, re.M):
+            f = list(map(int, fields.split()))
+            if f[7] > 1000:
+                ops[op] = (f[0], f[7])
+        return ops
+
     start_all()
 
     with subtest("every client runs under KVM"):
@@ -139,10 +152,14 @@ in
         assert built(err) == [], f"client1 rebuilt {built(err)}"
 
     with subtest("every client agrees on the store's contents"):
-        closures = {m.name: m.succeed(f"nix path-info --store '{store}' -r --json {combined}") for m in clients}
+        closures = {m.name: m.succeed(f"nix path-info --store '{store}' -r --json --json-format 1 {combined}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree on the closure of {combined}: {closures}"
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify --check-contents")
+
+    # Not an assertion, but a stall waiting on NFS shows up here.
+    for m in clients:
+        print(f"{m.name}: NFS operations taking over a second in total: {slow_nfs_ops(m) or 'none'}")
   '';
 }).overrideTestDerivation
   (_: {

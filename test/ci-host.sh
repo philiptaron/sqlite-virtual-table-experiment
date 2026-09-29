@@ -6,7 +6,8 @@
 #
 #   test/ci-host.sh start    install and start both servers
 #   test/ci-host.sh verify   check the host's view after the test
-#   test/ci-host.sh logs     print the metadata service's log
+#   test/ci-host.sh logs     print the metadata service's log and the
+#                            kernel's
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -60,7 +61,10 @@ case ${1:-} in
     ;;
 
   logs)
+    echo "# nixremote-server"
     cat "$work/server.log"
+    echo "# kernel"
+    sudo dmesg --ctime | tail -n 100
     ;;
 
   *)

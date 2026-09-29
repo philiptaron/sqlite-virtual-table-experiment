@@ -12,27 +12,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The runner has /dev/kvm, but only for root and the kvm group; Nix's
-      # build users need it too.
-      - name: Open /dev/kvm to every user
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
-            sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
-
-      # kvm and nixos-test are features the test derivation requires, so Nix
-      # won't start it without them. relaxed lets it set __noChroot to reach
-      # the servers on the host.
+      # enable_kvm opens the runner's /dev/kvm, normally only for root and
+      # the kvm group, to Nix's build users. kvm and nixos-test are features
+      # the test derivation requires, so Nix won't start it without them.
+      # relaxed lets it set __noChroot to reach the servers on the host.
       - uses: cachix/install-nix-action@v31
         with:
+          enable_kvm: true
           extra_nix_config: |
             system-features = nixos-test benchmark big-parallel kvm
             sandbox = relaxed
 
-      - name: Check that Nix offers builds the kvm feature
-        run: nix config show system-features | tee /dev/stderr | grep -qw kvm
+      - name: Check that Nix's build users get KVM
+        run: |
+          ls -l /dev/kvm
+          [[ $(stat -c %a /dev/kvm) == 666 ]]
+          nix config show system-features | tee /dev/stderr | grep -qw kvm
 
       - name: Start the NFS server and metadata service on the host
         run: test/ci-host.sh start
@@ -43,6 +38,6 @@ jobs:
       - name: Check the host's view of the store
         run: test/ci-host.sh verify
 
-      - name: Metadata service log
+      - name: Host logs
         if: always()
-        run: test/ci-host.sh logs | tail -n 200
+        run: test/ci-host.sh logs
