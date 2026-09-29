@@ -89,6 +89,55 @@ commit conflict (`--test-hooks`) and checks that Nix retries through it.
 `test/cache.py` then checks the cache's request counts and invalidation
 from a single long-lived connection.
 
+## A cluster over NFS
+
+`test/nfs-cluster.nix` is a NixOS test with three client VMs. The servers
+run outside the VMs, on the machine running the test: an NFS export holds
+the store's files and `nixremote-server` holds its metadata. The VMs reach
+both at `10.0.2.2`, which is where QEMU's user-mode network puts the
+host's loopback. Each client mounts the export at `/shared` and uses the
+store `local?root=/shared&state=/var/lib/nixremote`. Then:
+
+- one client copies busybox in, and every client sees it as valid;
+- all three build the same derivation at the same time. Its output lock
+  is a file on NFS, so exactly one builds it, and the others wait and
+  then find it valid;
+- one client builds a derivation over every client's output without
+  rebuilding any of them;
+- every client agrees on the closure and verifies the store's contents.
+
+The test found that reading what another host just wrote is slow, about
+100ms per file. nfsd gives the writer a write delegation on every file it
+creates, and the writer keeps them. A reader's OPEN of such a file gets
+NFS4ERR_DELAY while nfsd recalls the delegation. The writer returns it
+within milliseconds, but the reader's Linux client waits about 100ms
+before retrying. The first client to check busybox's roughly 900 files
+after client1 copied it in spent 95 seconds on this, against 2.5 seconds
+with delegations turned off (`fs.leases-enable=0` on the server). The
+trace step shows it: counts of NFS4ERR_DELAY per connection, the
+recalls, and each client's delegations sampled once a second.
+
+The test is a Nix build that requires the `kvm` feature, and it fails
+unless every VM reports KVM (`systemd-detect-virt`), so it never falls
+back to emulation. To see the host's servers it sets `__noChroot`, which
+needs `sandbox = relaxed`. That is why it lives in `legacyPackages` rather
+than `checks`.
+
+`.github/workflows/nfs-cluster.yml` runs it on `ubuntu-latest`.
+`test/ci-host.sh start` sets up the NFS export and the service on an
+Ubuntu host, and starts recording NFS traffic. After the test,
+`test/ci-host.sh verify` checks that the service's paths and the export's
+files match, and `test/ci-host.sh nfs-trace` summarizes the recording. The
+workflow uploads the full capture as the `nfs-trace` artifact. To run it by hand on such a
+host, with `sandbox = relaxed` and `kvm` in `system-features` in
+`nix.conf`:
+
+```sh
+test/ci-host.sh start
+nix build -L .#legacyPackages.x86_64-linux.nfs-cluster-test
+test/ci-host.sh verify
+```
+
 ## Not yet
 
 - Registering paths still costs a few round trips per path, mostly Nix
@@ -97,5 +146,8 @@ from a single long-lived connection.
 - CA derivations (`BuildTraceV3`) are unsupported. With `ca-derivations`
   enabled, Nix fails to open the store rather than keep that table locally
   on one host.
-- Nothing about NFS yet: locking, client caching, and write ordering are
-  still ahead.
+- On NFS, only what the cluster test exercises is known to work: build
+  locks across hosts and reading what another host wrote. Reading what
+  another host wrote costs about 100ms per file while nfsd hands out
+  write delegations (see above). Client caching and write ordering under
+  failures are still ahead.
