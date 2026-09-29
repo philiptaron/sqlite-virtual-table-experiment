@@ -150,6 +150,32 @@ in
     def reconnect(m):
         m.succeed("iptables -w -D OUTPUT -d ${host} -j DROP && iptables -w -D INPUT -s ${host} -j DROP")
 
+    def cut_off_mid_build(m, name):
+        """Have m build name (see cluster-builds.nix), and cut it off once
+        its output is half written."""
+        m.succeed(f"systemd-run --unit={name} --collect /run/current-system/sw/bin/cluster-build {name} -A {name}")
+        m.wait_until_succeeds(f"grep -qx started /shared/nix/store/*-nixremote-{name}.drv.chroot/root/nix/store/*-nixremote-{name}", timeout=120)
+        cut_off(m)
+
+    def fill_cache(name):
+        """Build name in a store of client3's own, and copy it to the binary
+        cache. Return its path and contents."""
+        fill = "/var/lib/cachefill"
+        client3.succeed(f"nix copy --no-check-sigs --to {fill} {busybox}")
+        client3.succeed(f"systemd-run --unit=fill-{name} --collect --setenv=STORE={fill} /run/current-system/sw/bin/cluster-build fill-{name} -A {name}")
+        rc, err = let_build_finish(client3, f"fill-{name}", f"{fill}/nix/var/nix")
+        assert rc == "0", f"client3 couldn't fill the cache with nixremote-{name}:\n{err}"
+        [path] = client3.succeed(f"cat /tmp/fill-{name}.out").split()
+        client3.succeed(f"nix copy --no-check-sigs --from {fill} --to file:///cache {path}")
+        return path, client3.succeed(f"cat {fill}{path}")
+
+    def substitute(m, name):
+        """Have m get name from the binary cache, in the background."""
+        m.succeed(
+            f"systemd-run --unit={name} --collect '--setenv=STORE={store}&require-sigs=false' "
+            f"/run/current-system/sw/bin/cluster-build {name} -A {name} --option substituters file:///cache"
+        )
+
     def hook(name, body="{}"):
         """Call one of the metadata service's test hooks, from client3,
         which never crashes."""
@@ -312,9 +338,7 @@ in
     # turn. Nix never learns that client1 lost the lock.
 
     with subtest("a client cut off mid-build, while another builds the same derivation"):
-        client1.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
-        client1.wait_until_succeeds("grep -qx started /shared/nix/store/*-nixremote-cutoff.drv.chroot/root/nix/store/*-nixremote-cutoff", timeout=120)
-        cut_off(client1)
+        cut_off_mid_build(client1, "cutoff")
         start = time.monotonic()
         client2.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
         # client2's build directory appears once it has the output lock.
@@ -337,24 +361,10 @@ in
             m.succeed(f"nix-store --store '{store}' --verify-path {cutoff}")
 
     with subtest("a client cut off mid-build, while another substitutes its output"):
-        # client3 fills the binary cache from a build in a store of its own.
-        fill = "/var/lib/cachefill"
-        client3.succeed(f"nix copy --no-check-sigs --to {fill} {busybox}")
-        client3.succeed(f"systemd-run --unit=fill --collect --setenv=STORE={fill} /run/current-system/sw/bin/cluster-build fill -A substituted")
-        rc, err = let_build_finish(client3, "fill", f"{fill}/nix/var/nix")
-        assert rc == "0", f"client3 couldn't fill the cache:\n{err}"
-        [substituted] = client3.succeed("cat /tmp/fill.out").split()
-        client3.succeed(f"nix copy --no-check-sigs --from {fill} --to file:///cache {substituted}")
-        cached = client3.succeed(f"cat {fill}{substituted}")
-
-        client1.succeed("systemd-run --unit=substituted --collect /run/current-system/sw/bin/cluster-build substituted -A substituted")
-        client1.wait_until_succeeds("grep -qx started /shared/nix/store/*-nixremote-substituted.drv.chroot/root/nix/store/*-nixremote-substituted", timeout=120)
-        cut_off(client1)
+        substituted, cached = fill_cache("substituted")
+        cut_off_mid_build(client1, "substituted")
         start = time.monotonic()
-        client2.succeed(
-            f"systemd-run --unit=substituted --collect '--setenv=STORE={store}&require-sigs=false' "
-            "/run/current-system/sw/bin/cluster-build substituted -A substituted --option substituters file:///cache"
-        )
+        substitute(client2, "substituted")
         rc, err = outcome(client2, "substituted")
         report(client2, "substituted", rc, err)
         print(f"with client1 cut off, client2 substituted nixremote-substituted after {time.monotonic() - start:.0f}s")
@@ -375,8 +385,49 @@ in
         # delete it: the path is valid, so no one builds it again.
         client3.succeed("rm -r /shared/nix/store/*-nixremote-substituted.drv.chroot")
 
+    with subtest("a client cut off mid-build, while another substitutes its output but has yet to register it"):
+        # As above, except that the service holds client2's commit. client1
+        # comes back and finishes while client2's files are in place but
+        # not yet registered.
+        raced, cached = fill_cache("raced")
+        cut_off_mid_build(client1, "raced")
+        # Only the next commit to register raced waits, which is client2's.
+        hook("hold-commits", json.dumps({"path": raced, "count": 1}))
+        start = time.monotonic()
+        substitute(client2, "raced")
+        client3.wait_until_succeeds("curl -sf -d '{}' ${backend}/v1/test/stats | grep -q '\"held\": 1'", timeout=300)
+        print(f"with client1 cut off, client2 substituted nixremote-raced after {time.monotonic() - start:.0f}s, and has yet to register it")
+        got = client3.succeed(f"cat /shared{raced}")
+        assert got == cached, f"client3 reads {got!r} from {raced} before client2 registers it, not the cache's {cached!r}"
+        reconnect(client1)
+        # client1 finds raced invalid, so it deletes client2's files, moves
+        # its own output into place, and registers it.
+        rc, err = let_build_finish(client1, "raced")
+        report(client1, "raced", rc, err)
+        assert rc == "0", f"client1's build of nixremote-raced should have finished, not exited {rc}"
+        built_by_client1 = client3.succeed(f"cat /shared{raced}")
+        assert built_by_client1 != cached, f"{raced} still holds what the cache held"
+        client3.succeed(f"nix-store --store '{store}' --verify-path {raced}")
+        # client2's commit conflicts, since raced is registered now. On the
+        # retry, Nix finds raced valid and updates its row with client2's
+        # hash, which the service allows.
+        released = hook("release-commits")
+        assert released == {"released": 1}, f"released {released}, want client2's one commit"
+        rc, err = outcome(client2, "raced")
+        report(client2, "raced", rc, err)
+        assert rc == "0", f"client2's substitution of nixremote-raced should have succeeded, not exited {rc}"
+        # So the files are client1's and the hash is the cache's.
+        for m in clients:
+            got = m.succeed(f"cat /shared{raced}")
+            assert got == built_by_client1, f"{m.name} reads {got!r} from {raced}, not client1's output {built_by_client1!r}"
+            m.fail(f"nix-store --store '{store}' --verify-path {raced}")
+        # Substituting it again puts back what the hash says.
+        client3.succeed(f"timeout 300 nix-store --store '{store}&require-sigs=false' --repair-path {raced} --option substituters file:///cache")
+        for m in clients:
+            m.succeed(f"nix-store --store '{store}' --verify-path {raced}")
+
     with subtest("in the end, every client agrees on the store's contents"):
-        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted}"
+        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:
