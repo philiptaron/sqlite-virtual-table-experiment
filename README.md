@@ -244,15 +244,22 @@ writes a random last line, so it's plain whose output ended up where.
   client1's build finishes, and it deletes client2's files, moves its
   own in, and registers them; the NFS client logs `lost 1 locks`, and
   Nix ignores `cannot close lock file`. Then client2's commit gets a 409,
-  and on the retry Nix finds the path valid and updates its row with
-  client2's hash, which the service allows. Both builds succeed, and the
-  store is corrupted: the files are client1's, the hash is the cache's,
-  and `--verify-path` fails on every host. Substituting it again
-  (`--repair-path`) puts it right. The test does that.
+  and on the retry Nix finds the path valid and goes to update its row
+  with client2's hash. The service refuses that (422, below), so client2's
+  substitution fails, and the path holds client1's output with client1's
+  hash. Without that check, both would succeed and the store would be
+  corrupted: client1's files with the cache's hash, failing
+  `--verify-path` on every host.
 
-The first two cases were safe only because of timing and an assertion.
-The third needs no more than a commit that arrives late, and the service
-has no way to tell that the host sending it lost the path's lock.
+The service refuses any commit that changes a registered path's hash,
+except the all-zero one Nix registers when it doesn't know a path's
+hash. That makes the third case safe, but not every ordering of it. If
+client2's commit lands after client1 has found the path invalid but
+before it moves its output in, client1's retry is the one refused, with
+its files already in place, and the path is corrupted anyway. The
+service can't tell whether a host still holds the path's lock, and the
+files move before any commit. The check also refuses `--repair` of a
+derivation that isn't reproducible, which gives the path a new hash.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
@@ -288,6 +295,6 @@ test/ci-host.sh verify
   locks across hosts, reading what another host wrote, with
   `delegation_watermark=0` on the hosts, and carrying on after a host
   crashes (see above). A host that's cut off can still overwrite a path
-  another host is registering (see above), and nothing stops it: the
-  service can't tell whether a host still holds the path's lock. Either
+  another host has just registered (see above), and nothing stops it:
+  the service can't tell whether a host still holds the path's lock. Either
   server restarting is still ahead.
