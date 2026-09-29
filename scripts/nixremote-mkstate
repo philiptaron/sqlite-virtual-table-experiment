@@ -58,3 +58,8 @@ EOF
 # Nix's schema version (nixSchemaVersion). Matching it means Nix opens the
 # database as-is instead of creating or migrating tables.
 printf 10 > "$state/db/schema"
+
+# A host that crashes soon after this must not come back with an empty
+# schema file, which Nix calls corrupt and refuses to open. Plain sync, as
+# macOS's takes no files.
+sync
