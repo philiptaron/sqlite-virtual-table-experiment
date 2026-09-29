@@ -125,6 +125,21 @@ class Invalid(Failure):
     status = 422
 
 
+class Dropped(Failure):
+    """A held commit released without applying it (see hold_commits)."""
+
+    status = 503
+
+
+class Hold:
+    """Commits waiting on /v1/test/release-commits."""
+
+    def __init__(self):
+        self.waiting = 0
+        self.drop = False
+        self.released = threading.Event()
+
+
 def table(req):
     name = req.get("table")
     if name not in TABLES:
@@ -180,6 +195,7 @@ class Store:
         self.pool = queue.LifoQueue()
         self.lock = threading.Lock()
         self.injected_conflicts = 0  # see fail_commits
+        self.hold = None  # see hold_commits
         self.requests = {}  # endpoint -> count, for stats
         conn = self.connect()
         conn.executescript(SCHEMA)
@@ -249,6 +265,13 @@ class Store:
             if self.injected_conflicts > 0:
                 self.injected_conflicts -= 1
                 raise Conflict("injected conflict (--test-hooks)")
+            hold = self.hold
+            if hold:
+                hold.waiting += 1
+        if hold:
+            hold.released.wait()
+            if hold.drop:
+                raise Dropped("held commit dropped (--test-hooks)")
         conn.execute("begin immediate")
         try:
             for op in ops:
@@ -272,10 +295,31 @@ class Store:
             remaining, self.injected_conflicts = self.injected_conflicts, self.injected_conflicts + count
         return {"remaining": remaining}
 
-    def stats(self, conn, req):
-        """Test hook: how many requests each endpoint has served."""
+    def hold_commits(self, conn, req):
+        """Test hook: make commits wait, having been received in full, until
+        release_commits. A host that dies meanwhile has sent its commit but
+        never learns whether it was applied."""
         with self.lock:
-            return {"requests": dict(self.requests)}
+            if not self.hold:
+                self.hold = Hold()
+            return {"held": self.hold.waiting}
+
+    def release_commits(self, conn, req):
+        """Test hook: apply the held commits, or with drop, answer them 503
+        without applying them, as if they had never arrived."""
+        with self.lock:
+            hold, self.hold = self.hold, None
+        if not hold:
+            return {"released": 0}
+        hold.drop = bool(req.get("drop"))
+        hold.released.set()
+        return {"released": hold.waiting}
+
+    def stats(self, conn, req):
+        """Test hook: how many requests each endpoint has served, and how
+        many commits are held."""
+        with self.lock:
+            return {"requests": dict(self.requests), "held": self.hold.waiting if self.hold else 0}
 
     def count(self, endpoint):
         with self.lock:
@@ -335,6 +379,8 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/v1/query": store.query, "/v1/commit": store.commit}
         if self.server.test_hooks:
             routes["/v1/test/fail-commits"] = store.fail_commits
+            routes["/v1/test/hold-commits"] = store.hold_commits
+            routes["/v1/test/release-commits"] = store.release_commits
             routes["/v1/test/stats"] = store.stats
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.path not in routes:
@@ -356,7 +402,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # The host is gone, whether or not its request was applied.
+            self.close_connection = True
+            self.log_message("could not answer %s: the host hung up", self.path)
 
     def log_message(self, fmt, *args):
         if self.server.verbose:
