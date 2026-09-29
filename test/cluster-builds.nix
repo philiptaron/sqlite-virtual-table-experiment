@@ -50,4 +50,5 @@ in
   cutoff = waiting "cutoff";
   substituted = waiting "substituted";
   raced = waiting "raced";
+  overtaken = waiting "overtaken";
 }
