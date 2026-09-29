@@ -132,12 +132,21 @@ class Dropped(Failure):
 
 
 class Hold:
-    """Commits waiting on /v1/test/release-commits."""
+    """Commits waiting on /v1/test/release-commits: the next `count` of those
+    that register, change or delete the path with id `id_`, or every commit
+    if either is None."""
 
-    def __init__(self):
+    def __init__(self, id_, count):
+        self.id = id_
+        self.count = count
         self.waiting = 0
         self.drop = False
         self.released = threading.Event()
+
+    def takes(self, ops):
+        if self.count is not None and self.waiting >= self.count:
+            return False
+        return self.id is None or any(op_path_id(op) == self.id for op in ops)
 
 
 def table(req):
@@ -145,6 +154,16 @@ def table(req):
     if name not in TABLES:
         raise BadRequest(f"no such table {name!r}")
     return name, TABLES[name]
+
+
+def op_path_id(op):
+    """The ValidPaths id an op touches, if it is a ValidPaths op."""
+    if op.get("table") != "ValidPaths":
+        return None
+    if op.get("op") == "insert":
+        cols = op.get("cols")
+        return path_id(cols[1]) if isinstance(cols, list) and len(cols) > 1 else None
+    return op.get("id")
 
 
 def epoch(conn):
@@ -266,6 +285,8 @@ class Store:
                 self.injected_conflicts -= 1
                 raise Conflict("injected conflict (--test-hooks)")
             hold = self.hold
+            if hold and not hold.takes(ops):
+                hold = None
             if hold:
                 hold.waiting += 1
         if hold:
@@ -298,11 +319,21 @@ class Store:
     def hold_commits(self, conn, req):
         """Test hook: make commits wait, having been received in full, until
         release_commits. A host that dies meanwhile has sent its commit but
-        never learns whether it was applied."""
+        never learns whether it was applied. With `path`, only commits that
+        touch that path's ValidPaths row wait, and with `count`, only the
+        next `count` of them; the others go ahead. Hosts can't be told apart
+        by address, since they may all come through one NAT."""
+        path, count = req.get("path"), req.get("count")
+        id_ = None if path is None else path_id(path)
+        if path is not None and id_ is None:
+            raise BadRequest(f"{path!r} is not a store path")
+        if count is not None and (not isinstance(count, int) or count < 1):
+            raise BadRequest(f"bad count {count!r}")
         with self.lock:
-            if not self.hold:
-                self.hold = Hold()
-            return {"held": self.hold.waiting}
+            if self.hold:
+                raise BadRequest("commits are held already")
+            self.hold = Hold(id_, count)
+        return {"held": 0}
 
     def release_commits(self, conn, req):
         """Test hook: apply the held commits, or with drop, answer them 503
