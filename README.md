@@ -253,13 +253,23 @@ writes a random last line, so it's plain whose output ended up where.
 
 The service refuses any commit that changes a registered path's hash,
 except the all-zero one Nix registers when it doesn't know a path's
-hash. That makes the third case safe, but not every ordering of it. If
-client2's commit lands after client1 has found the path invalid but
-before it moves its output in, client1's retry is the one refused, with
-its files already in place, and the path is corrupted anyway. The
-service can't tell whether a host still holds the path's lock, and the
-files move before any commit. The check also refuses `--repair` of a
-derivation that isn't reproducible, which gives the path a new hash.
+hash. That makes the third case safe, but not every ordering of it. The
+test also has the service answer client1's check that the path is
+invalid, and hold the answer until client2's commit has landed:
+
+- **Another host registers the output just after this one finds it
+  invalid.** client2's substitution succeeds and the path verifies. Then
+  client1 hears that the path is invalid, deletes client2's files, and
+  moves its own in. Registering them, it finds the path valid, and the
+  service refuses to change the hash (422), so client1's build fails.
+  But its files are in place, with the cache's hash, and `--verify-path`
+  fails on every host until the path is substituted again.
+
+No check in the service can prevent that: the files move before any
+commit, and the service can't tell whether a host still holds the
+path's lock. Only the host can, before it deletes and moves anything.
+The check also refuses `--repair` of a derivation that isn't
+reproducible, which gives the path a new hash.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
