@@ -238,15 +238,21 @@ writes a random last line, so it's plain whose output ended up where.
   its own output over the one client2 substituted. The abort skips
   cleanup, so client1's chroot stays on the export for good: the path is
   valid, so no one will build it again. The test deletes it.
+- **Another host substitutes the output, and hasn't registered it yet.**
+  As above, but the service holds client2's commit, so client1 comes
+  back while client2's files are in place and the path is invalid.
+  client1's build finishes, and it deletes client2's files, moves its
+  own in, and registers them; the NFS client logs `lost 1 locks`, and
+  Nix ignores `cannot close lock file`. Then client2's commit gets a 409,
+  and on the retry Nix finds the path valid and updates its row with
+  client2's hash, which the service allows. Both builds succeed, and the
+  store is corrupted: the files are client1's, the hash is the cache's,
+  and `--verify-path` fails on every host. Substituting it again
+  (`--repair-path`) puts it right. The test does that.
 
-Neither case corrupted the store, but that rests on timing and on an
-assertion. If client1 finishes after client2 has put the substituted
-files in place but before client2's commit, it finds the path invalid,
-deletes client2's files, moves its own in, and registers them. client2's
-commit then fails with 409, and on the retry Nix updates the row, which
-the service allows. Whichever commit lands last sets the hash, and if
-the build isn't reproducible, the path's contents no longer match it.
-That window isn't tested yet.
+The first two cases were safe only because of timing and an assertion.
+The third needs no more than a commit that arrives late, and the service
+has no way to tell that the host sending it lost the path's lock.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
@@ -258,7 +264,8 @@ than `checks`.
 `test/ci-host.sh start` sets up the NFS export and the service on an
 Ubuntu host, and starts recording NFS traffic. After the test,
 `test/ci-host.sh verify` checks that the service's paths and the export's
-files match, and `test/ci-host.sh nfs-trace` summarizes the recording. The
+files match, and that each one's contents have the hash the service
+holds, and `test/ci-host.sh nfs-trace` summarizes the recording. The
 workflow uploads the full capture as the `nfs-trace` artifact. To run it by hand on such a
 host, with `sandbox = relaxed` and `kvm` in `system-features` in
 `nix.conf`:
@@ -281,6 +288,6 @@ test/ci-host.sh verify
   locks across hosts, reading what another host wrote, with
   `delegation_watermark=0` on the hosts, and carrying on after a host
   crashes (see above). A host that's cut off can still overwrite a path
-  another host registered (see above), and nothing stops it: the
+  another host is registering (see above), and nothing stops it: the
   service can't tell whether a host still holds the path's lock. Either
   server restarting is still ahead.
