@@ -1,7 +1,9 @@
 name: NFS cluster
 
 on:
+  # Pull requests run on their own; pushing to one shouldn't run it twice.
   push:
+    branches: [lex]
   pull_request:
   workflow_dispatch:
 
