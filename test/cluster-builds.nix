@@ -24,6 +24,9 @@ let
     };
   own = name: mk "nixremote-${name}" "cat ${shared} > $out; echo ${name} >> $out";
   shared = mk "nixremote-shared" "sleep 10; echo shared > $out";
+  waiting =
+    name:
+    mk "nixremote-${name}" "echo started > $out; while [ ! -e go ]; do sleep 0.2; done; cat /proc/sys/kernel/random/uuid >> $out";
 in
 {
   # Every client asks for this at once. The sleep keeps the first build
@@ -39,4 +42,11 @@ in
   # its output. Another client then has to take over the output lock from
   # a host that will never release it, and build it again.
   interrupted = mk "nixremote-interrupted" "echo started > $out; sleep 20; echo finished >> $out";
+  # For cutting a client off mid-build. These wait, halfway through, for a
+  # file named go in the build directory, which is local to the client
+  # building it; so the test lets each client's build finish separately.
+  # The random last line makes every build's output different, so that
+  # which client's output ended up registered is plain to see.
+  cutoff = waiting "cutoff";
+  substituted = waiting "substituted";
 }
