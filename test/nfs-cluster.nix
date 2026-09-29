@@ -19,12 +19,12 @@ let
     "client3"
   ];
   # Store paths without references for a client to copy in and crash while
-  # committing: 20 files of 1MB each.
+  # committing: 20 files of about 1MB each.
   payload =
     name:
     pkgs.runCommand "nixremote-${name}" { } ''
       mkdir $out
-      for i in $(seq 20); do yes ${name} $i | head -c 1000000 > $out/$i; done
+      for i in $(seq 20); do seq -f "${name} $i %06g" 60000 > $out/$i; done
     '';
   dropped = payload "dropped";
   applied = payload "applied";
