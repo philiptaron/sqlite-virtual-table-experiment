@@ -49,4 +49,5 @@ in
   # which client's output ended up registered is plain to see.
   cutoff = waiting "cutoff";
   substituted = waiting "substituted";
+  raced = waiting "raced";
 }
