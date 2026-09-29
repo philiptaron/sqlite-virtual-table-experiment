@@ -85,17 +85,25 @@ case ${1:-} in
     trace() { tshark -r "$pcap" -n -T fields -e frame.time -e tcp.stream "$@" 2>&1; }
 
     echo "# nfsd's clients and the state each holds, whenever that changes"
-    awk '{ k = $2 " " $3; v = substr($0, length($1) + 2); if (last[k] != v) print; last[k] = v }' \
+    # Keyed by address: the names have spaces in them.
+    awk '{ for (i = 2; i <= NF; i++) if ($i ~ /^127\.0\.0\.1:/) addr = $i
+           v = substr($0, length($1) + 2); if (last[addr] != v) print; last[addr] = v }' \
       "$work/nfsd-states.log"
 
     echo "# connections in the capture: time, tcp.stream, client port"
     trace -Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0' -e tcp.srcport
 
-    echo "# callbacks: the server's calls to clients, and their replies"
-    trace -Y '(tcp.srcport == 2049 && rpc.msgtyp == 0) || (tcp.dstport == 2049 && rpc.msgtyp == 1)' -e _ws.col.Info
+    echo "# callbacks: the server's calls to clients, and their replies, by connection"
+    tshark -r "$pcap" -n -Y '(tcp.srcport == 2049 && rpc.msgtyp == 0) || (tcp.dstport == 2049 && rpc.msgtyp == 1)' \
+      -T fields -e tcp.stream -e _ws.col.Info 2>&1 |
+      sed -E 's/ \(Call In [0-9]+\)//' | sort | uniq -c
 
-    echo "# NFS errors other than NOENT"
-    trace -Y 'nfs.nfsstat4 && nfs.nfsstat4 != 0 && nfs.nfsstat4 != 2' -e _ws.col.Info
+    # A compound has a status per operation, and != would need all of them
+    # to differ; > matches if any does. 2 is NOENT, which lookups get.
+    echo "# NFS errors other than NOENT, by connection"
+    tshark -r "$pcap" -n -Y 'nfs.nfsstat4 > 2' -T fields -e tcp.stream -e _ws.col.Info 2>&1 |
+      awk -F'\t' '{ match($2, /NFS4ERR_[A-Z_]+/); print "stream " $1 ": " substr($2, RSTART, RLENGTH) }' |
+      sort | uniq -c
 
     echo "# pauses of over 5 seconds on a connection, and what ended them"
     tshark -r "$pcap" -n -Y rpc -T fields -e frame.time_epoch -e tcp.stream -e _ws.col.Info 2>&1 |

@@ -95,17 +95,19 @@ in
         """The names of the derivations a nix-build actually built."""
         return re.findall(r"^building '/nix/store/[a-z0-9]+-([^']+)\.drv'", err, re.M)
 
-    def slow_nfs_ops(m):
-        """The NFS operations on /shared that m has spent over a second on,
-        in total, as {op: (count, milliseconds)}."""
+    def notable_nfs_ops(m):
+        """The NFS operations on /shared that m has spent over a second on
+        in total, or that have failed, as {op: (count, milliseconds,
+        errors)}. Time spent backing off before a retry isn't counted, but
+        the error that caused it is."""
         [stats] = [d for d in m.succeed("cat /proc/self/mountstats").split("device ") if " mounted on /shared " in d]
         ops = {}
-        # ops, transmissions, timeouts, bytes sent, bytes received, then
-        # milliseconds queued, in flight, and in total (then errors).
-        for op, fields in re.findall(r"^\s+([A-Z_]+): (\d+(?: \d+){7,})$", stats, re.M):
+        # ops, transmissions, timeouts, bytes sent, bytes received,
+        # milliseconds queued, in flight, and in total, errors.
+        for op, fields in re.findall(r"^\s+([A-Z_]+): (\d+(?: \d+){8})$", stats, re.M):
             f = list(map(int, fields.split()))
-            if f[7] > 1000:
-                ops[op] = (f[0], f[7])
+            if f[7] > 1000 or f[8] > 0:
+                ops[op] = (f[0], f[7], f[8])
         return ops
 
     start_all()
@@ -157,9 +159,11 @@ in
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify --check-contents")
 
-    # Not an assertion, but a stall waiting on NFS shows up here.
+    # Not an assertion. A client reading files another client wrote shows
+    # OPEN errors here: each is an NFS4ERR_DELAY while the writer's
+    # delegation is recalled, and a retry about 100ms later.
     for m in clients:
-        print(f"{m.name}: NFS operations taking over a second in total: {slow_nfs_ops(m) or 'none'}")
+        print(f"{m.name}: NFS operations over a second or with errors (count, ms, errors): {notable_nfs_ops(m) or 'none'}")
   '';
 }).overrideTestDerivation
   (_: {
