@@ -216,7 +216,8 @@ to come back, but its build directory is local. After the lease, nfsd
 gives its locks to the next host that asks. When the network comes back,
 its NFS client reopens by file handle the files that still exist, and
 marks the lock lost (`recover_lost_locks` is off). Nix never touches its
-lock file during a build, so it never learns that the lock is gone.
+lock file during a build, so it never learns that the lock is gone, but
+the plugin checks for it (below).
 
 The test cuts client1 off (iptables drops everything to and from the
 host) while it builds a derivation that waits for a local file partway
@@ -241,40 +242,38 @@ writes a random last line, so it's plain whose output ended up where.
 - **Another host substitutes the output, and hasn't registered it yet.**
   As above, but the service holds client2's commit, so client1 comes
   back while client2's files are in place and the path is invalid.
-  client1's build finishes, and it deletes client2's files, moves its
-  own in, and registers them; the NFS client logs `lost 1 locks`, and
-  Nix ignores `cannot close lock file`. Then client2's commit gets a 409,
-  and on the retry Nix finds the path valid and goes to update its row
-  with client2's hash. The service refuses that (422, below), so client2's
-  substitution fails, and the path holds client1's output with client1's
-  hash. Without that check, both would succeed and the store would be
-  corrupted: client1's files with the cache's hash, failing
-  `--verify-path` on every host.
+  client1's build finishes, and it asks whether the path is valid, to
+  decide whether to delete what's there and move its own output in. The
+  plugin finds that client1 lost its lock and fails the query, so
+  client1's build fails, and client2's files stay. client2's commit then
+  goes through.
+- **Another host registers the output just after this one finds it
+  invalid.** The same, except that the service also holds its answer
+  to client1 until client2's commit has landed. The plugin gets that the
+  path is invalid, finds that client1 lost its lock, and fails the query.
+  The outcome is the same.
+
+Without the plugin's check, both corrupt the store. client1 deletes
+client2's files and moves its own in, and the path ends up with client1's
+files and the cache's hash. In the first case, that's because client2's
+commit gets a 409, and on the retry Nix finds the path valid and updates
+the row with its own hash. In the second, client2's commit was the one
+that landed.
 
 The service refuses any commit that changes a registered path's hash,
-except the all-zero one Nix registers when it doesn't know a path's
-hash. That makes the third case safe, but not every ordering of it. The
-test also has the service answer client1's check that the path is
-invalid, and hold the answer until client2's commit has landed:
+except the all-zero one Nix registers when it doesn't know a path's hash.
+That's enough to make the first case safe without the plugin's check,
+but not the second: there the files move before any commit, and the
+service can't tell whether a host still holds the path's lock. It also
+refuses `--repair` of a derivation that isn't reproducible, which gives
+the path a new hash.
 
-- **Another host registers the output just after this one finds it
-  invalid.** client2's substitution succeeds and the path verifies. Then
-  client1 hears that the path is invalid, deletes client2's files, and
-  moves its own in. Registering them, it finds the path valid, and the
-  service refuses to change the hash (422), so client1's build fails.
-  But its files are in place, with the cache's hash, and `--verify-path`
-  fails on every host until the path is substituted again.
+### How a host tells it lost its lock
 
-No check in the service can prevent that: the files move before any
-commit, and the service can't tell whether a host still holds the
-path's lock. Only the host can, before it deletes and moves anything.
-The check also refuses `--repair` of a derivation that isn't
-reproducible, which gives the path a new hash.
-
-A host can tell that it lost a lock, but only by asking the server. The
-test has a probe (`test/lockprobe.py`) take a lock on the export like
-Nix's, on client1 and then on client2 once client1 is cut off, and try
-what a process can check on its own descriptor. On Linux 6.18:
+Only by asking the server. The test has a probe (`test/lockprobe.py`)
+take a lock on the export like Nix's, on client1 and then on client2 once
+client1 is cut off. Each tries what a process can check on its own
+descriptor. On Linux 6.18:
 
 | Check | client2, holding the lock | client1, having lost it |
 |---|---|---|
@@ -285,11 +284,20 @@ what a process can check on its own descriptor. On Linux 6.18:
 
 An NFS client that marks a lock lost fails reads and writes under it
 with EIO, but the lock file is empty, so an ordinary read never reaches
-the server. `O_DIRECT` makes it. It fails as soon as client1 is back, so
-a host could check this before it deletes and moves anything. Taking the
-lock again isn't a check: with no one else holding it, it may succeed.
-The probe must never close another descriptor for the lock file, since
-closing any of them drops all of the process's locks on it.
+the server. `O_DIRECT` makes it, and it fails as soon as client1 is
+back. Taking the lock again isn't a check: with no one else holding it,
+it may succeed. Closing another descriptor for the lock file is out too,
+since that drops all of the process's locks on it.
+
+So the plugin (`src/lock.c`) looks for a path's lock file among its
+process's descriptors in `/proc/self/fd`, and reads each one on NFS with
+`O_DIRECT`. It does this before it answers that a path is invalid, and
+before it registers or changes a path. If a read fails with EIO, the
+query or write fails with `SQLITE_IOERR`, which Nix doesn't retry. That
+costs a scan of `/proc/self/fd` for each lookup that finds no path and
+each write of one, plus a READ for each lock file it finds. It only
+works on Linux. It also leaves a window: a host cut off after the check
+and before it moves its output could still overwrite another's.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
@@ -324,7 +332,8 @@ test/ci-host.sh verify
 - On NFS, only what the cluster test exercises is known to work: build
   locks across hosts, reading what another host wrote, with
   `delegation_watermark=0` on the hosts, and carrying on after a host
-  crashes (see above). A host that's cut off can still overwrite a path
-  another host has just registered (see above), and nothing stops it:
-  the service can't tell whether a host still holds the path's lock. Either
-  server restarting is still ahead.
+  crashes (see above). A host that's cut off stops before it overwrites
+  a path another host holds the lock on, on Linux, but only because the
+  plugin checks at the right moment (see above). It still deletes
+  another host's chroot if they build the same derivation. Either server
+  restarting is still ahead.
