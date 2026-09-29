@@ -38,6 +38,21 @@
         }
       );
 
+      # Not a check: the test needs servers outside the build sandbox (see
+      # test/nfs-cluster.nix), so `nix flake check` can't run it.
+      legacyPackages =
+        nixpkgs.lib.genAttrs
+          [
+            "aarch64-linux"
+            "x86_64-linux"
+          ]
+          (system: {
+            nfs-cluster-test = import ./test/nfs-cluster.nix {
+              pkgs = nixpkgs.legacyPackages.${system};
+              nixremote = self.packages.${system}.default;
+            };
+          });
+
       devShells = forAllSystems (
         system:
         let
