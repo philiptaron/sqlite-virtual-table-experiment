@@ -167,11 +167,16 @@ in
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify --check-contents")
 
-    # Not an assertion. A client reading files another client wrote shows
-    # OPEN errors here: each is an NFS4ERR_DELAY while the writer's
-    # delegation is recalled, and a retry about 100ms later.
-    for m in clients:
-        print(f"{m.name}: NFS operations over a second or with errors (count, ms, errors): {notable_nfs_ops(m) or 'none'}")
+    with subtest("reading what another client wrote doesn't wait on delegation recalls"):
+        # Each recall shows up as a failed OPEN: NFS4ERR_DELAY, then a retry
+        # about 100ms later. With the writer keeping its delegations, the
+        # first client to verify busybox failed about 900 of them and took
+        # 95 seconds; with delegation_watermark=0, a few.
+        for m in clients:
+            ops = notable_nfs_ops(m)
+            print(f"{m.name}: NFS operations over a second or with errors (count, ms, errors): {ops or 'none'}")
+            failed_opens = sum(ops.get(op, (0, 0, 0))[2] for op in ("OPEN", "OPEN_NOATTR"))
+            assert failed_opens < 100, f"{m.name} failed {failed_opens} OPENs; is a writer keeping its delegations?"
   '';
 }).overrideTestDerivation
   (_: {
