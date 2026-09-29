@@ -423,8 +423,51 @@ in
             assert got == built_by_client1, f"{m.name} reads {got!r} from {raced}, not client1's output {built_by_client1!r}"
             m.succeed(f"nix-store --store '{store}' --verify-path {raced}")
 
+    with subtest("a client cut off mid-build, whose check that its output is invalid is overtaken by another's commit"):
+        # As above, except that client2's commit lands after client1 has
+        # found the path invalid, and before it moves its output in: the
+        # service holds its answer to client1.
+        overtaken, cached = fill_cache("overtaken")
+        cut_off_mid_build(client1, "overtaken")
+        hook("hold-commits", json.dumps({"path": overtaken, "count": 1}))
+        start = time.monotonic()
+        substitute(client2, "overtaken")
+        client3.wait_until_succeeds("curl -sf -d '{}' ${backend}/v1/test/stats | grep -q '\"held\": 1'", timeout=300)
+        print(f"with client1 cut off, client2 substituted nixremote-overtaken after {time.monotonic() - start:.0f}s, and has yet to register it")
+        # Once its builder is done, the first thing client1 asks about
+        # overtaken is whether it's valid, to decide whether to move its
+        # output in (derivation-builder.cc).
+        hook("hold-queries", json.dumps({"path": overtaken, "count": 1}))
+        reconnect(client1)
+        client1.succeed("for d in /var/lib/nixremote/builds/nix-*/build; do touch $d/go; done")
+        client3.wait_until_succeeds("curl -sf -d '{}' ${backend}/v1/test/stats | grep -q '\"held_queries\": 1'", timeout=120)
+        released = hook("release-commits")
+        assert released == {"released": 1}, f"released {released}, want client2's one commit"
+        rc, err = outcome(client2, "overtaken")
+        report(client2, "overtaken", rc, err)
+        assert rc == "0", f"client2's substitution of nixremote-overtaken should have succeeded, not exited {rc}"
+        client3.succeed(f"nix-store --store '{store}' --verify-path {overtaken}")
+        # client1 hears that overtaken is invalid, though client2 has just
+        # registered it. So it deletes client2's files and moves its own in,
+        # and then registering them, finds the path valid and goes to update
+        # its row with its own hash, which the service refuses.
+        released = hook("release-queries")
+        assert released == {"released": 1}, f"released {released}, want client1's one query"
+        rc, err = outcome(client1, "overtaken")
+        report(client1, "overtaken", rc, err)
+        assert rc != "0" and "is registered with hash" in err, f"client1's build of nixremote-overtaken should have been refused, not exited {rc}"
+        # So the files are client1's and the hash is the cache's.
+        for m in clients:
+            got = m.succeed(f"cat /shared{overtaken}")
+            assert got != cached, f"{m.name} reads what the cache held from {overtaken}; client1's output should have replaced it"
+            m.fail(f"nix-store --store '{store}' --verify-path {overtaken}")
+        # Substituting it again puts back what the hash says.
+        client3.succeed(f"timeout 300 nix-store --store '{store}&require-sigs=false' --repair-path {overtaken} --option substituters file:///cache")
+        for m in clients:
+            m.succeed(f"nix-store --store '{store}' --verify-path {overtaken}")
+
     with subtest("in the end, every client agrees on the store's contents"):
-        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced}"
+        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:
