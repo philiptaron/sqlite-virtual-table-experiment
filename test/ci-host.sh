@@ -73,7 +73,7 @@ case ${1:-} in
   logs)
     echo "# nixremote-server"
     cat "$work/server.log"
-    echo "# kernel"
+    echo "# kernel $(uname -r)"
     sudo dmesg --ctime | tail -n 100
     ;;
 
