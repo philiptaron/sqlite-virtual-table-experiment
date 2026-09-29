@@ -45,7 +45,7 @@ let
       # holds a write delegation on every file in it, and each other host's
       # first open of each file waits for a recall: NFS4ERR_DELAY, then a
       # retry 100ms later.
-      boot.extraModprobeConfig = "options nfs delegation_watermark=0";
+      boot.extraModprobeConfig = "options nfsv4 delegation_watermark=0";
       # QEMU's user-mode network. Each VM has its own, so they can all be
       # 10.0.2.15.
       networking.useDHCP = false;
@@ -128,7 +128,7 @@ in
         for m in clients:
             m.succeed("curl -sf ${backend}/v1/health")
             m.succeed("mkdir -p /shared && mount -t nfs4 -o vers=4.2 ${host}:/ /shared")
-            watermark = m.succeed("cat /sys/module/nfs/parameters/delegation_watermark").strip()
+            watermark = m.succeed("cat /sys/module/nfsv4/parameters/delegation_watermark").strip()
             assert watermark == "0", f"{m.name} has delegation_watermark={watermark}, want 0"
             m.succeed("nixremote-mkstate /var/lib/nixremote ${backend}")
 
