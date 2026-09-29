@@ -402,27 +402,23 @@ in
         got = client3.succeed(f"cat /shared{raced}")
         assert got == cached, f"client3 reads {got!r} from {raced} before client2 registers it, not the cache's {cached!r}"
         reconnect(client1)
-        # client1 finds raced invalid, so it deletes client2's files, moves
-        # its own output into place, and registers it.
+        # client1 goes to ask whether raced is valid, which it isn't yet, to
+        # decide whether to delete what's there and move its own output in.
+        # The plugin finds that client1 has lost its lock on raced, and
+        # fails the query instead (src/lock.c).
         rc, err = let_build_finish(client1, "raced")
         report(client1, "raced", rc, err)
-        assert rc == "0", f"client1's build of nixremote-raced should have finished, not exited {rc}"
-        built_by_client1 = client3.succeed(f"cat /shared{raced}")
-        assert built_by_client1 != cached, f"{raced} still holds what the cache held"
-        client3.succeed(f"nix-store --store '{store}' --verify-path {raced}")
-        # client2's commit conflicts, since raced is registered now. On the
-        # retry, Nix finds raced valid and goes to update its row with
-        # client2's hash, which the service refuses, so client2's
-        # substitution fails.
+        assert rc != "0" and "lost its lock on" in err, f"client1's build of nixremote-raced should have been stopped, not exited {rc}"
+        got = client3.succeed(f"cat /shared{raced}")
+        assert got == cached, f"client3 reads {got!r} from {raced}; client1 should have left client2's files alone"
         released = hook("release-commits")
         assert released == {"released": 1}, f"released {released}, want client2's one commit"
         rc, err = outcome(client2, "raced")
         report(client2, "raced", rc, err)
-        assert rc != "0" and "is registered with hash" in err, f"client2's substitution of nixremote-raced should have been refused, not exited {rc}"
-        # So the files are client1's and so is the hash.
+        assert rc == "0", f"client2's substitution of nixremote-raced should have succeeded, not exited {rc}"
         for m in clients:
             got = m.succeed(f"cat /shared{raced}")
-            assert got == built_by_client1, f"{m.name} reads {got!r} from {raced}, not client1's output {built_by_client1!r}"
+            assert got == cached, f"{m.name} reads {got!r} from {raced}, not the cache's {cached!r}"
             m.succeed(f"nix-store --store '{store}' --verify-path {raced}")
 
     with subtest("a client cut off mid-build, whose check that its output is invalid is overtaken by another's commit"):
@@ -449,23 +445,18 @@ in
         report(client2, "overtaken", rc, err)
         assert rc == "0", f"client2's substitution of nixremote-overtaken should have succeeded, not exited {rc}"
         client3.succeed(f"nix-store --store '{store}' --verify-path {overtaken}")
-        # client1 hears that overtaken is invalid, though client2 has just
-        # registered it. So it deletes client2's files and moves its own in,
-        # and then registering them, finds the path valid and goes to update
-        # its row with its own hash, which the service refuses.
+        # The plugin gets the answer that overtaken is invalid, though client2
+        # has just registered it. Before passing that on, it finds that
+        # client1 has lost its lock on overtaken, and fails the query
+        # instead, so client1 never deletes client2's files.
         released = hook("release-queries")
         assert released == {"released": 1}, f"released {released}, want client1's one query"
         rc, err = outcome(client1, "overtaken")
         report(client1, "overtaken", rc, err)
-        assert rc != "0" and "is registered with hash" in err, f"client1's build of nixremote-overtaken should have been refused, not exited {rc}"
-        # So the files are client1's and the hash is the cache's.
+        assert rc != "0" and "lost its lock on" in err, f"client1's build of nixremote-overtaken should have been stopped, not exited {rc}"
         for m in clients:
             got = m.succeed(f"cat /shared{overtaken}")
-            assert got != cached, f"{m.name} reads what the cache held from {overtaken}; client1's output should have replaced it"
-            m.fail(f"nix-store --store '{store}' --verify-path {overtaken}")
-        # Substituting it again puts back what the hash says.
-        client3.succeed(f"timeout 300 nix-store --store '{store}&require-sigs=false' --repair-path {overtaken} --option substituters file:///cache")
-        for m in clients:
+            assert got == cached, f"{m.name} reads {got!r} from {overtaken}, not the cache's {cached!r}"
             m.succeed(f"nix-store --store '{store}' --verify-path {overtaken}")
 
     with subtest("what a client that lost its lock can tell"):
