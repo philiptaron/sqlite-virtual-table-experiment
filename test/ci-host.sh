@@ -27,6 +27,9 @@ case ${1:-} in
     # 10.0.2.2:/.
     echo "$export_dir 127.0.0.1(rw,sync,insecure,no_root_squash,no_subtree_check,fsid=0)" |
       sudo tee /etc/exports >/dev/null
+    # EXPERIMENT: does client2's 90 second stall go away without
+    # delegations? nfsd grants none while leases are off.
+    sudo sysctl fs.leases-enable=0
     sudo systemctl restart nfs-kernel-server
     sudo exportfs -v
 
