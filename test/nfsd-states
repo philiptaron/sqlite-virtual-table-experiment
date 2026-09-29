@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Once a second, print each NFS client nfsd knows and a count of the state
+# it holds, for test/ci-host.sh. The name says which VM a client is; the
+# address says which connection it is in a capture. Run as root.
+#
+#   12:34:56.789 Linux NFSv4.2 client2 127.0.0.1:41234 deleg:r=3 open:rw=1
+while :; do
+  now=$(date +%T.%N | cut -c1-12)
+  for c in /proc/fs/nfsd/clients/*/; do
+    [[ -e $c/info ]] || continue
+    name=$(sed -n 's/^name: "\(.*\)"$/\1/p' "$c/info")
+    addr=$(sed -n 's/^address: "\(.*\)"$/\1/p' "$c/info")
+    states=$(grep -o 'type: [a-z]*, access: [a-z]*' "$c/states" 2>/dev/null |
+      sed 's/type: //; s/, access: /:/' | sort | uniq -c | awk '{ printf " %s=%s", $2, $1 }')
+    echo "$now $name $addr$states"
+  done
+  sleep 1
+done
