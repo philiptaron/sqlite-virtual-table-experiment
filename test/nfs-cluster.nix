@@ -28,6 +28,8 @@ let
     '';
   dropped = payload "dropped";
   applied = payload "applied";
+  # For a client to copy in while the metadata service restarts.
+  replayed = payload "replayed";
 
   client =
     { config, pkgs, ... }:
@@ -47,6 +49,14 @@ let
         echo $rc >/tmp/"$round".rc
       '';
       lockProbe = pkgs.writeShellScriptBin "lockprobe" ''exec ${pkgs.python3}/bin/python3 ${./lockprobe.py} "$@"'';
+      # logged ROUND COMMAND...: run COMMAND, leaving /tmp/ROUND.{out,err,rc}.
+      logged = pkgs.writeShellScriptBin "logged" ''
+        round=$1
+        shift
+        rc=0
+        "$@" >/tmp/"$round".out 2>/tmp/"$round".err || rc=$?
+        echo $rc >/tmp/"$round".rc
+      '';
     in
     {
       virtualisation.memorySize = 1536;
@@ -78,6 +88,7 @@ let
         nixremote
         clusterBuild
         lockProbe
+        logged
         pkgs.curl
         pkgs.iptables
         pkgs.sqlite
@@ -85,6 +96,7 @@ let
       virtualisation.additionalPaths = [
         dropped
         applied
+        replayed
       ];
     };
 in
@@ -106,6 +118,7 @@ in
     busybox = "${pkgs.busybox}"
     dropped = "${dropped}"
     applied = "${applied}"
+    replayed = "${replayed}"
     clients = [${toString (map (c: "${c},") clients)}]
 
     def build_everywhere(round, args, machines=clients):
@@ -234,6 +247,11 @@ in
         m.crash()
         released = hook("release-commits", json.dumps({"drop": drop}))
         assert released == {"released": 1}, f"released {released}, want the one commit {m.name} sent"
+
+    def host(name, body="{}"):
+        """Have the host kill the metadata service or restart the NFS server
+        (test/host-control), from client3."""
+        return json.loads(client3.succeed(f"curl -sf -H 'Content-Type: application/json' -d '{body}' http://${host}:8081/v1/{name}"))
 
     def restart(m):
         """Boot m again after a crash, with the store mounted again."""
@@ -548,8 +566,50 @@ in
             m.wait_until_succeeds("! systemctl is-active lockprobe", timeout=60)
         client3.succeed(f"rm {lock}")
 
+    with subtest("clients carry on while the metadata service is down, and a commit it applied without answering is applied once"):
+        # client1 copies a path in. The service applies the commit, and is
+        # killed before it answers. client1 sends the commit again until the
+        # service is back, which finds it applied already.
+        hook("hold-replies", json.dumps({"path": replayed, "count": 1}))
+        client1.succeed(f"systemd-run --unit=replayed --collect /run/current-system/sw/bin/logged replayed /run/current-system/sw/bin/nix copy --no-check-sigs --to '{store}' {replayed}")
+        client3.wait_until_succeeds("curl -sf -d '{}' ${backend}/v1/test/stats | grep -q '\"held_replies\": 1'", timeout=120)
+        host("kill-service", json.dumps({"down": 15}))
+        start = time.monotonic()
+        # A new process, so nothing it asks is cached.
+        client2.succeed(f"/run/current-system/sw/bin/logged downtime /run/current-system/sw/bin/nix path-info --store '{store}' {busybox}")
+        rc, err = outcome(client2, "downtime")
+        report(client2, "downtime", rc, err)
+        print(f"client2's lookup took {time.monotonic() - start:.0f}s with the service down for 15s")
+        assert rc == "0" and "trying again" in err, f"client2's lookup should have waited for the service, not exited {rc}"
+        rc, err = outcome(client1, "replayed")
+        report(client1, "replayed", rc, err)
+        assert rc == "0" and "trying again" in err, f"client1's copy should have sent its commit again, not exited {rc}"
+        stats = hook("stats")
+        assert stats["repeated"] == 1, f"the service should have seen client1's commit once more, having applied it: {stats}"
+        for m in clients:
+            m.succeed(f"nix-store --store '{store}' --verify-path {replayed}")
+
+    with subtest("clients building the same derivation while the NFS server restarts build it once"):
+        # client1 holds the output lock through the restart, reclaiming it
+        # in nfsd's grace period, so client2 goes on waiting for it.
+        client1.succeed("systemd-run --unit=nfsrestart --collect /run/current-system/sw/bin/cluster-build nfsrestart -A nfsrestart")
+        client1.wait_until_succeeds("grep -qx started /shared/nix/store/*-nixremote-nfsrestart.drv.chroot/root/nix/store/*-nixremote-nfsrestart", timeout=120)
+        client2.succeed("systemd-run --unit=nfsrestart --collect /run/current-system/sw/bin/cluster-build nfsrestart -A nfsrestart")
+        restarted = host("restart-nfsd")
+        print(f"the host restarted nfsd in {restarted['seconds']:.1f}s")
+        start = time.monotonic()
+        rc, err = let_build_finish(client1, "nfsrestart")
+        report(client1, "nfsrestart", rc, err)
+        print(f"client1 finished nixremote-nfsrestart {time.monotonic() - start:.0f}s after nfsd restarted")
+        assert rc == "0", f"client1's build of nixremote-nfsrestart should have survived nfsd restarting, not exited {rc}"
+        [nfsrestart] = client1.succeed("cat /tmp/nfsrestart.out").split()
+        out, err = finished(client2, "nfsrestart")
+        assert out == [nfsrestart] and built(err) == [], f"client2 should have waited for client1's lock, and found nixremote-nfsrestart valid:\n{err}"
+        for m in clients:
+            m.succeed(f"nix-store --store '{store}' --verify-path {nfsrestart}")
+
     with subtest("in the end, every client agrees on the store's contents"):
-        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken}"
+        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken} {replayed} {nfsrestart}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:

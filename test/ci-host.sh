@@ -2,7 +2,8 @@
 # The host half of test/nfs-cluster.nix, for an Ubuntu machine such as
 # GitHub Actions' ubuntu-latest: an NFS export for the shared store's files
 # and nixremote-server for its metadata, both on the host's loopback, where
-# the test's VMs reach them at 10.0.2.2.
+# the test's VMs reach them at 10.0.2.2. test/host-control runs the
+# service and lets the test restart either server.
 #
 #   test/ci-host.sh start      install and start both servers, and start
 #                              recording NFS traffic and nfsd's state
@@ -44,14 +45,14 @@ case ${1:-} in
     sudo nohup test/nfsd-states >"$work/nfsd-states.log" 2>&1 &
 
     # --test-hooks: the test holds commits to crash a client mid-commit.
-    nohup python3 server/nixremote-server --db "$db" --listen 127.0.0.1:8080 -v --test-hooks \
-      >"$work/server.log" 2>&1 &
-    echo $! >"$work/server.pid"
+    sudo nohup python3 test/host-control --log "$work/server.log" --user "$(id -un)" -- \
+      python3 server/nixremote-server --db "$db" --listen 127.0.0.1:8080 -v --test-hooks \
+      >"$work/host-control.log" 2>&1 &
     for _ in $(seq 50); do
       curl -sf http://127.0.0.1:8080/v1/health >/dev/null && exit 0
       sleep 0.2
     done
-    cat "$work/server.log"
+    cat "$work/host-control.log" "$work/server.log"
     exit 1
     ;;
 
@@ -68,7 +69,7 @@ case ${1:-} in
     fi
     echo "$(wc -l <<<"$registered") store paths, each registered with the service and present on the export:"
     echo "$registered"
-    for name in shared client1 client2 client3 combined interrupted dropped applied blip cutoff substituted raced overtaken; do
+    for name in shared client1 client2 client3 combined interrupted dropped applied blip cutoff substituted raced overtaken replayed nfsrestart; do
       grep -q -- "-nixremote-$name\$" <<<"$registered" || { echo "no nixremote-$name output"; exit 1; }
     done
     # And what's on the export has the hash the service holds for it: a NAR
@@ -86,6 +87,8 @@ case ${1:-} in
     ;;
 
   logs)
+    echo "# test/host-control"
+    cat "$work/host-control.log"
     echo "# nixremote-server"
     cat "$work/server.log"
     echo "# kernel $(uname -r)"

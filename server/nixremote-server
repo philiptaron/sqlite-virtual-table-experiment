@@ -31,6 +31,7 @@ import queue
 import sqlite3
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Nix's schema (src/libstore/schema.sql), except that ValidPaths ids come
@@ -67,6 +68,10 @@ create table if not exists DerivationOutputs (
 create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
 create table if not exists Meta (key text primary key, value integer not null);
 insert or ignore into Meta values ('epoch', 0);
+-- The ids of recent commits, so that one a host sends again, not knowing
+-- whether it arrived, is applied only once.
+create table if not exists Commits (id text primary key, time integer not null);
+create index if not exists IndexCommits on Commits(time);
 """
 
 TABLES = {
@@ -94,6 +99,8 @@ TABLES = {
 }
 
 OPERATORS = {"eq": "=", "ge": ">=", "gt": ">"}
+# How long a commit's id is remembered: far longer than a host retries.
+COMMIT_ID_SECONDS = 3600
 MAX_LIMIT = 10000
 NIX_BASE32 = "0123456789abcdfghijklmnpqrsvwxyz"
 # What Nix registers for a path whose hash it doesn't know, and fills in
@@ -229,7 +236,8 @@ class Store:
         self.pool = queue.LifoQueue()
         self.lock = threading.Lock()
         self.injected_conflicts = 0  # see fail_commits
-        self.holds = {"commits": None, "queries": None}  # see hold
+        self.holds = {"commits": None, "queries": None, "replies": None}  # see hold
+        self.repeated = 0  # commits sent again after being applied, for stats
         self.requests = {}  # endpoint -> count, for stats
         conn = self.connect()
         conn.executescript(SCHEMA)
@@ -295,26 +303,44 @@ class Store:
         return result
 
     def commit(self, conn, req):
-        ops = req.get("ops")
+        """Apply a commit's ops in one transaction. A host that loses the
+        connection before the answer sends the commit again with the same
+        id, and a commit whose id was applied already is answered as if
+        applied again."""
+        ops, commit_id = req.get("ops"), req.get("id")
         if not isinstance(ops, list):
             raise BadRequest("ops must be a list")
+        if commit_id is not None and (not isinstance(commit_id, str) or not 0 < len(commit_id) <= 64):
+            raise BadRequest(f"bad commit id {commit_id!r}")
         with self.lock:
             if self.injected_conflicts > 0:
                 self.injected_conflicts -= 1
                 raise Conflict("injected conflict (--test-hooks)")
-        self.wait_if_held("commits", {op_path_id(op) for op in ops})
+        ids = {op_path_id(op) for op in ops}
+        self.wait_if_held("commits", ids)
         conn.execute("begin immediate")
         try:
-            for op in ops:
-                self.apply(conn, op)
-            # Deleting or changing a path invalidates what hosts have cached.
-            if any(op.get("table") == "ValidPaths" and op.get("op") != "insert" for op in ops):
-                conn.execute("update Meta set value = value + 1 where key = 'epoch'")
-            result = {"epoch": epoch(conn)}
+            if commit_id is not None and conn.execute("select 1 from Commits where id = ?", (commit_id,)).fetchone():
+                with self.lock:
+                    self.repeated += 1
+                result = {"epoch": epoch(conn), "repeated": True}
+            else:
+                for op in ops:
+                    self.apply(conn, op)
+                # Deleting or changing a path invalidates what hosts have cached.
+                if any(op.get("table") == "ValidPaths" and op.get("op") != "insert" for op in ops):
+                    conn.execute("update Meta set value = value + 1 where key = 'epoch'")
+                if commit_id is not None:
+                    now = int(time.time())
+                    conn.execute("insert into Commits values (?, ?)", (commit_id, now))
+                    conn.execute("delete from Commits where time < ?", (now - COMMIT_ID_SECONDS,))
+                result = {"epoch": epoch(conn)}
         except BaseException:
             conn.execute("rollback")
             raise
         conn.execute("commit")
+        # A held answer is to a commit that has been applied.
+        self.wait_if_held("replies", ids)
         return result
 
     def fail_commits(self, conn, req):
@@ -339,12 +365,14 @@ class Store:
                 raise Dropped(f"held {kind} dropped (--test-hooks)")
 
     def hold(self, kind, req):
-        """Test hook: make commits or queries wait until released.
+        """Test hook: make commits, queries, or replies to commits wait until
+        released.
 
         A held commit has been received in full, so a host that dies
         meanwhile has sent it but never learns whether it was applied. A
         held query has been answered, but the answer isn't sent, so the host
-        acts on it only once the database may have moved on.
+        acts on it only once the database may have moved on. A held reply is
+        to a commit that has been applied.
 
         With `path`, only those about that path's ValidPaths row wait, and
         with `count`, only the next `count` of them; the others go ahead.
@@ -375,11 +403,18 @@ class Store:
         return {"released": hold.waiting}
 
     def stats(self, conn, req):
-        """Test hook: how many requests each endpoint has served, and how
-        many commits and queries are held."""
+        """Test hook: how many requests each endpoint has served, how many
+        commits, queries, and replies are held, and how many commits were
+        sent again after being applied."""
         with self.lock:
             held = {kind: hold.waiting if hold else 0 for kind, hold in self.holds.items()}
-            return {"requests": dict(self.requests), "held": held["commits"], "held_queries": held["queries"]}
+            return {
+                "requests": dict(self.requests),
+                "held": held["commits"],
+                "held_queries": held["queries"],
+                "held_replies": held["replies"],
+                "repeated": self.repeated,
+            }
 
     def count(self, endpoint):
         with self.lock:

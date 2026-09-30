@@ -27,13 +27,19 @@ case ${1:-http} in
     backend="file:$work/remote.sqlite"
     ;;
   http)
-    server/nixremote-server --db "$work/remote.sqlite" --listen 127.0.0.1:0 --port-file "$work/port" --test-hooks 2>"$work/server.log" &
-    server_pid=$!
-    for _ in $(seq 100); do
-      [[ -e $work/port ]] && break
-      sleep 0.1
-    done
-    [[ -e $work/port ]] || { cat "$work/server.log"; exit 1; }
+    # start_server [PORT]: start the service, on PORT or any free port.
+    start_server() {
+      rm -f "$work/port"
+      server/nixremote-server --db "$work/remote.sqlite" --listen "127.0.0.1:${1:-0}" --port-file "$work/port" \
+        --test-hooks 2>>"$work/server.log" &
+      server_pid=$!
+      for _ in $(seq 100); do
+        [[ -e $work/port ]] && break
+        sleep 0.1
+      done
+      [[ -e $work/port ]] || { cat "$work/server.log"; exit 1; }
+    }
+    start_server
     backend="http://127.0.0.1:$(cat "$work/port")"
     ;;
   *)
@@ -195,6 +201,40 @@ SQL
   cat "$work/cache.out"
   failures=$((failures + $(grep -c '^FAIL' "$work/cache.out" || true)))
   [[ $rc == 0 ]] || grep -q '^FAIL' "$work/cache.out" || not_ok "test/cache.py exited $rc"
+
+  echo "# the service restarting"
+  port=$(cat "$work/port")
+  hook() { curl -sf -H 'Content-Type: application/json' -d "${2:-{\}}" "$backend/v1/test/$1"; }
+  kill -9 $server_pid
+  wait $server_pid 2>/dev/null || true
+  nixr nix path-info --store "$a" "$top" >/dev/null 2>"$work/down.err" & pid=$!
+  sleep 2
+  start_server "$port"
+  rc=0
+  wait $pid || rc=$?
+  [[ $rc == 0 ]] && grep -q 'trying again' "$work/down.err" &&
+    ok "a query waits for the service to come back" || { not_ok "a query while the service is down exited $rc"; sed 's/^/     /' "$work/down.err"; }
+
+  # The service applies the commit, and is killed before answering.
+  hook hold-replies '{"count": 1}' >/dev/null
+  nixr nix-instantiate --store "$a" -E "${expr/nixremote-test/nixremote-replayed}" >"$work/replayed.out" 2>"$work/replayed.err" & pid=$!
+  for _ in $(seq 100); do
+    hook stats | grep -q '"held_replies": 1' && break
+    sleep 0.1
+  done
+  kill -9 $server_pid
+  wait $server_pid 2>/dev/null || true
+  start_server "$port"
+  rc=0
+  wait $pid || rc=$?
+  if [[ $rc == 0 ]] && hook stats | grep -q '"repeated": 1'; then
+    ok "a commit sent again after it was applied is applied once"
+  else
+    not_ok "a commit whose answer was lost: exited $rc, $(hook stats)"
+    sed 's/^/     /' "$work/replayed.err"
+  fi
+  nixr nix-store --store "$a" --verify-path "$(cat "$work/replayed.out")" &&
+    ok "and its path is valid" || not_ok "the replayed commit's path isn't valid"
 fi
 
 echo "# a path registered behind Nix's back reads as a retryable conflict"
