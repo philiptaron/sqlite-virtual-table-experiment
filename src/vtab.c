@@ -94,6 +94,11 @@ static int parse_arg(const char *arg, char **key, char **value) {
   return 1;
 }
 
+static int is_seconds(const char *s) {
+  size_t n = strspn(s, "0123456789");
+  return n > 0 && n < 7 && s[n] == '\0';
+}
+
 static int xConnect(sqlite3 *db, void *aux, int argc, const char *const *argv,
                     sqlite3_vtab **out, char **err) {
   (void)aux;
@@ -107,7 +112,8 @@ static int xConnect(sqlite3 *db, void *aux, int argc, const char *const *argv,
   }
 
   char *uri = NULL;
-  int allow_delete = 0, rc = SQLITE_OK;
+  /* The NFS server's lease in seconds, for the watchdog; nfsd's default. */
+  int allow_delete = 0, lease = 90, rc = SQLITE_OK;
   for (int i = 3; i < argc && rc == SQLITE_OK; i++) {
     char *key, *value;
     if (!parse_arg(argv[i], &key, &value)) {
@@ -123,6 +129,8 @@ static int xConnect(sqlite3 *db, void *aux, int argc, const char *const *argv,
       allow_delete = 1;
     } else if (strcmp(key, "deletes") == 0 && strcmp(value, "deny") == 0) {
       allow_delete = 0;
+    } else if (strcmp(key, "lease") == 0 && is_seconds(value)) {
+      lease = atoi(value);
     } else {
       *err = sqlite3_mprintf("nixremote: unknown argument \"%s\"", argv[i]);
       rc = SQLITE_ERROR;
@@ -152,6 +160,9 @@ static int xConnect(sqlite3 *db, void *aux, int argc, const char *const *argv,
   }
   if (rc == SQLITE_OK)
     rc = sqlite3_declare_vtab(db, table->decl);
+  /* Before Nix takes any lock in the store. */
+  if (rc == SQLITE_OK)
+    nr_watchdog_start(lease);
 
   nr_vtab *vt = NULL;
   if (rc == SQLITE_OK && !(vt = sqlite3_malloc(sizeof *vt)))

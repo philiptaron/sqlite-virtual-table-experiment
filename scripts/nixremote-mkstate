@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 # Create a Nix state directory whose db.sqlite points at a nixremote backend.
 #
-#   nixremote-mkstate STATE_DIR BACKEND_URI [deny|allow]
+#   nixremote-mkstate [--lease SECONDS] STATE_DIR BACKEND_URI [deny|allow]
 #
 # STATE_DIR is what Nix calls the state directory (/nix/var/nix, or the
 # `state=` of a local store URL). The third argument says whether this host
 # may delete store paths (garbage collect); it defaults to deny.
 #
+# --lease is the NFS server's lease (nfsd's lease-time, 90 by default). A
+# Nix process that holds a lock in the store and hears nothing from the
+# server for two thirds of that kills itself (src/lock.c). 0 turns that off.
+#
 # The plugin is found at $NIXREMOTE_LIB, or next to this script in ../lib.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "usage: $0 STATE_DIR BACKEND_URI [deny|allow]" >&2
+lease=90
+if [[ ${1:-} == --lease ]]; then
+  lease=${2:-}
+  shift 2 || true
+fi
+if [[ $# -lt 2 || $# -gt 3 || ! $lease =~ ^[0-9]+$ ]]; then
+  echo "usage: $0 [--lease SECONDS] STATE_DIR BACKEND_URI [deny|allow]" >&2
   exit 2
 fi
 state=$1
@@ -38,7 +47,7 @@ fi
 mkdir -p "$state/db"
 
 # Single quotes inside the SQL string literal are doubled.
-args="backend='${backend//\'/\'\'}', deletes=$deletes"
+args="backend='${backend//\'/\'\'}', deletes=$deletes, lease=$lease"
 
 # SchemaMigrations stays a real (local, constant) table. Listing the
 # migrations Nix knows about keeps it from trying to run them here; the

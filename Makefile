@@ -10,6 +10,9 @@ LDSHARED = -dynamiclib
 else
 SOEXT = so
 LDSHARED = -shared
+# For the NFS lease watchdog's threads (src/lock.c).
+CFLAGS += -pthread
+LDLIBS += -pthread
 endif
 
 LIB = libnixremote.$(SOEXT)

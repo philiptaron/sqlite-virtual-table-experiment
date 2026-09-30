@@ -68,7 +68,7 @@ case ${1:-} in
     fi
     echo "$(wc -l <<<"$registered") store paths, each registered with the service and present on the export:"
     echo "$registered"
-    for name in shared client1 client2 client3 combined interrupted dropped applied cutoff substituted raced overtaken; do
+    for name in shared client1 client2 client3 combined interrupted dropped applied blip cutoff substituted failed raced overtaken; do
       grep -q -- "-nixremote-$name\$" <<<"$registered" || { echo "no nixremote-$name output"; exit 1; }
     done
     # And what's on the export has the hash the service holds for it: a NAR
