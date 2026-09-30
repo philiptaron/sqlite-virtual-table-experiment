@@ -49,6 +49,8 @@ struct nr_backend_ops {
   int (*begin)(nr_backend *);
   int (*commit)(nr_backend *);
   int (*rollback)(nr_backend *);
+  /* Optional: report path as one this host may have overwritten. */
+  int (*suspect)(nr_backend *, const char *path);
 };
 
 /* Every backend's state, and every result set, starts with one of these. */
@@ -122,6 +124,13 @@ static inline int nr_delete(nr_backend *b, const struct nr_table *t, sqlite3_int
 static inline int nr_begin(nr_backend *b) { return b->ops->begin(b); }
 static inline int nr_commit(nr_backend *b) { return b->ops->commit(b); }
 static inline int nr_rollback(nr_backend *b) { return b->ops->rollback(b); }
+
+/* Tell whoever holds the metadata that this host acted on path without
+ * its lock, so its files may not be the ones registered. Outside any
+ * transaction, and only if the backend keeps such a list. */
+static inline int nr_suspect(nr_backend *b, const char *path) {
+  return b->ops->suspect ? b->ops->suspect(b, path) : SQLITE_OK;
+}
 
 /*
  * The ValidPaths id of a store path. The hash part of

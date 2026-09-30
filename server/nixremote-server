@@ -17,6 +17,10 @@ valid updates its row rather than registering it, and a commit that would
 change the hash that way is refused (422). Otherwise a host whose files
 were replaced after it wrote them would set their hash from its own.
 
+A host that finds it has lost its lock on a path, having maybe moved its
+own files in already, reports the path (/v1/suspect). /v1/suspects lists
+those for someone to verify, and forgets the ones they have.
+
 Hosts cache what stays true while a path is valid: its row, references,
 and derivation outputs. Every response carries an epoch that goes up
 whenever a commit deletes or changes a path, and a host that sees a new
@@ -81,6 +85,14 @@ create table if not exists BuildTraceV3 (
 );
 create table if not exists Meta (key text primary key, value integer not null);
 insert or ignore into Meta values ('epoch', 0);
+-- Paths a host acted on after losing its lock, so their files may not be
+-- the ones registered (see suspect).
+create table if not exists Suspects (
+    path text primary key,
+    first integer not null,
+    last integer not null,
+    reports integer not null
+);
 -- The ids of recent commits, so that one a host sends again, not knowing
 -- whether it arrived, is applied only once.
 create table if not exists Commits (id text primary key, time integer not null);
@@ -365,6 +377,41 @@ class Store:
         self.wait_if_held("replies", ids)
         return result
 
+    def suspect(self, conn, req):
+        """A host lost its lock on a path, and may have moved its own files
+        in before it noticed. Keep the path until someone verifies it."""
+        path = req.get("path")
+        if path_id(path) is None:
+            raise BadRequest(f"{path!r} is not a store path")
+        now = int(time.time())
+        conn.execute(
+            "insert into Suspects values (?, ?, ?, 1)"
+            " on conflict (path) do update set last = excluded.last, reports = reports + 1",
+            (path, now, now),
+        )
+        return {}
+
+    def suspects(self, conn, req):
+        """The paths hosts have reported (see suspect), with the hash each is
+        registered with, if any, after forgetting those in `clear`: paths
+        whose contents someone has since checked, or repaired."""
+        clear = req.get("clear", [])
+        if not isinstance(clear, list) or not all(isinstance(p, str) for p in clear):
+            raise BadRequest("clear must be a list of paths")
+        conn.execute("begin immediate")
+        try:
+            conn.executemany("delete from Suspects where path = ?", [(p,) for p in clear])
+            rows = conn.execute(
+                "select s.path, s.first, s.last, s.reports, v.hash"
+                " from Suspects s left join ValidPaths v on v.path = s.path order by s.first"
+            ).fetchall()
+        except BaseException:
+            conn.execute("rollback")
+            raise
+        conn.execute("commit")
+        cols = ["path", "first", "last", "reports", "hash"]
+        return {"suspects": [dict(zip(cols, row)) for row in rows]}
+
     def fail_commits(self, conn, req):
         """Test hook: answer the next `count` commits with a conflict."""
         count = req.get("count", 0)
@@ -509,7 +556,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         store = self.server.store
-        routes = {"/v1/query": store.query, "/v1/commit": store.commit}
+        routes = {
+            "/v1/query": store.query,
+            "/v1/commit": store.commit,
+            "/v1/suspect": store.suspect,
+            "/v1/suspects": store.suspects,
+        }
         if self.server.test_hooks:
             routes["/v1/test/fail-commits"] = store.fail_commits
             for kind in store.holds:

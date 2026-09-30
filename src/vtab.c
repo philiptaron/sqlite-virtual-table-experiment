@@ -66,13 +66,20 @@ static int backend_fail(nr_vtab *vt, int rc) {
  * before it deletes whatever is at the output path and moves its own build
  * there, and a host that lost the lock may be about to delete another
  * host's files that way. SQLITE_IOERR isn't one Nix retries.
+ *
+ * The process may have moved its output in already: say, its host froze
+ * between an earlier check and the move, and Nix asks again after moving.
+ * The plugin can't tell which, so it reports the path to the service as
+ * suspect either way, for someone to verify.
  */
 static int fence(nr_vtab *vt, const char *path) {
   if (!nr_lock_lost(path))
     return SQLITE_OK;
+  int reported = nr_suspect(vt->conn->backend, path) == SQLITE_OK;
   return fail(vt, SQLITE_IOERR,
               "nixremote: this process lost its lock on %s.lock, so another host may be "
-              "building or adding %s; refusing to act on it", path, path);
+              "building or adding %s; refusing to act on it%s", path, path,
+              reported ? ", and reporting it as suspect" : "");
 }
 
 /* Split a module argument like  backend='file:/x'  into key and unquoted value. */

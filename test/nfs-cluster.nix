@@ -248,6 +248,11 @@ in
         released = hook("release-commits", json.dumps({"drop": drop}))
         assert released == {"released": 1}, f"released {released}, want the one commit {m.name} sent"
 
+    def suspects():
+        """The paths hosts have reported acting on without their lock."""
+        listed = client3.succeed("curl -sf -H 'Content-Type: application/json' -d '{}' ${backend}/v1/suspects")
+        return {s["path"] for s in json.loads(listed)["suspects"]}
+
     def host(name, body="{}"):
         """Have the host kill the metadata service or restart the NFS server
         (test/host-control), from client3."""
@@ -493,6 +498,9 @@ in
         rc, err = let_build_finish(client1, "raced", unguarded)
         report(client1, "raced", rc, err)
         assert rc != "0" and "lost its lock on" in err, f"client1's build of nixremote-raced should have been stopped, not exited {rc}"
+        # It can't tell whether it had moved its output in already, so it
+        # reports the path as suspect.
+        assert "reporting it as suspect" in err and raced in suspects(), f"client1 should have reported {raced} as suspect: {suspects()}"
         got = client3.succeed(f"cat /shared{raced}")
         assert got == cached, f"client3 reads {got!r} from {raced}; client1 should have left client2's files alone"
         released = hook("release-commits")
@@ -538,6 +546,7 @@ in
         rc, err = outcome(client1, "overtaken")
         report(client1, "overtaken", rc, err)
         assert rc != "0" and "lost its lock on" in err, f"client1's build of nixremote-overtaken should have been stopped, not exited {rc}"
+        assert "reporting it as suspect" in err and overtaken in suspects(), f"client1 should have reported {overtaken} as suspect: {suspects()}"
         for m in clients:
             got = m.succeed(f"cat /shared{overtaken}")
             assert got == cached, f"{m.name} reads {got!r} from {overtaken}, not the cache's {cached!r}"
@@ -632,6 +641,9 @@ in
     with subtest("in the end, every client agrees on the store's contents"):
         paths = f"{combined} {ca_out} {ca_user} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken} {replayed} {nfsrestart}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
+        # Only the two that client1 stopped at without the watchdog; both
+        # hold client2's files, and verify below.
+        assert suspects() == {raced, overtaken}, f"the service lists {suspects()} as suspect, want {raced} and {overtaken}"
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify --check-contents")
