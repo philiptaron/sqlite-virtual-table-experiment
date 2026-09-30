@@ -70,7 +70,8 @@ because the service checks every commit against its current state.
 
 Both settings are URL parameters, for example
 `http://host:port?cache_ttl=60&prefetch=500`. `cache_ttl=0` turns the cache
-off.
+off. A third, `retry=60`, is how many seconds a host keeps sending a
+request whose connection failed (see "Either server restarting" below).
 
 ## Try it
 
@@ -114,7 +115,9 @@ uses the store `local?root=/shared&state=/var/lib/nixremote`. Then:
   registering a path, both before and after its commit reaches the
   service (see below);
 - client1 is cut off from the host partway through a build, while
-  another client builds or substitutes the same output (see below).
+  another client builds or substitutes the same output (see below);
+- the metadata service is killed, and nfsd restarted, while clients are
+  using them (see below).
 
 ### Delegations: set `nfsv4.delegation_watermark=0` on every host
 
@@ -363,6 +366,42 @@ check leave open is a process or host frozen for longer than the lease
 between the check and the move; a paused VM's clock may not even show
 the pause. Both work only on Linux.
 
+### Either server restarting
+
+**The metadata service.** A host sends a request again when its
+connection fails, for up to `retry=` seconds (60 by default), backing off
+from 0.1 to 2 seconds: when the service isn't there, or goes away before
+answering. It doesn't for a timeout, or for an answer, even an error. A
+commit may have been applied by a service that died before answering, so
+each commit carries a random id, from `/dev/urandom` rather than SQLite's
+generator, which the processes a Nix daemon forks would share. The
+service records the ids it applies, in the same transaction, for an hour,
+and answers a commit whose id it has seen as if it had just applied it.
+
+The test has the host kill the service with SIGKILL (`test/host-control`)
+and start it again 15 seconds later. First the service applies a commit
+from client1, which is copying a path in, and holds its answer (the
+`hold-replies` test hook), so client1 never hears it. Meanwhile, client2
+looks a path up. Both wait for the service: client2's lookup took the 15
+seconds, and client1's commit arrived again, and was counted as applied
+already rather than applied twice. Without the id, it would have got a
+409, since the path was registered already, and Nix would have retried
+the whole transaction.
+
+**nfsd.** Restarting it drops every client's opens and locks. With
+`nfsdcld` tracking which clients it had, as on Ubuntu, it then starts a
+90-second grace period in which only those clients' reclaims are
+allowed, and ends it once they've all reclaimed. The test restarts it
+while client1 builds a derivation that client2 is waiting to build.
+client1 reclaimed its lock, and grace ended 43 or 44 seconds after the
+restart.
+Its build finished 59 seconds after the restart, and client2 went on
+waiting, then found the output valid. The test doesn't cover a server
+that can't tell which clients it had. That server would refuse their
+reclaims, and a Nix process that held a lock would carry on without it,
+with only the lock check to stop it (see above): the watchdog hears from
+the server all along.
+
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
 back to emulation. To see the host's servers it sets `__noChroot`, which
@@ -371,7 +410,8 @@ than `checks`.
 
 `.github/workflows/nfs-cluster.yml` runs it on `ubuntu-latest`.
 `test/ci-host.sh start` sets up the NFS export and the service on an
-Ubuntu host, and starts recording NFS traffic. After the test,
+Ubuntu host, and starts recording NFS traffic. `test/host-control`, run as
+root, runs the service and lets the test kill it or restart nfsd. After the test,
 `test/ci-host.sh verify` checks that the service's paths and the export's
 files match, and that each one's contents have the hash the service
 holds, and `test/ci-host.sh nfs-trace` summarizes the recording. The
@@ -398,4 +438,4 @@ test/ci-host.sh verify
   `delegation_watermark=0` on the hosts, and carrying on after a host
   crashes (see above), and a host that's cut off, which kills its Nix
   processes before another host can take their locks, on Linux (see
-  above). Either server restarting is still ahead.
+  above), and either server restarting.
