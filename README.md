@@ -4,8 +4,9 @@ A cache-coherent virtual table for use as a Nix file store DB
 The goal: many hosts mount one read/write `/nix/store` over NFS. The files
 are fine on NFS; Nix's SQLite database (`/nix/var/nix/db/db.sqlite`) is
 not. So each host keeps a local, constant `db.sqlite` whose `ValidPaths`,
-`Refs`, and `DerivationOutputs` tables are SQLite virtual tables, and every
-read and write goes to one metadata service that provides consistency.
+`Refs`, and `DerivationOutputs` tables, and for CA derivations
+`BuildTraceV3`, are SQLite virtual tables, and every read and write goes
+to one metadata service that provides consistency.
 
 ## Pieces
 
@@ -44,6 +45,33 @@ Nix can get a new path's id immediately, even though the commit is
 buffered. When a transaction conflicts with another host's changes, the
 service answers 409. The host turns that into `SQLITE_BUSY`, Nix retries
 the transaction, and on the retry it re-checks what it relied on.
+
+## CA derivations
+
+With `ca-derivations`, Nix records what each derivation output was built
+as in a fourth table, `BuildTraceV3`, and looks there to decide whether an
+output needs building. `nixremote-mkstate` makes it a virtual table like
+the others, and lists its schema migration, so that Nix doesn't try to
+create it locally. Its ids aren't from a store path. The backend numbers
+them, as Nix's schema does, and the HTTP backend makes up the id it hands
+Nix for a new row, which Nix never reads.
+
+Nix's schema has only an index on `(drvPath, outputName)`. The service
+makes it unique, since a second row for the same output is what two hosts
+racing to register it would make. The second host gets a 409, and Nix,
+retrying, finds the first host's row. It then adds its signatures if it
+built the same path, and fails if it built another. The service also
+refuses to change a row's output path. Nothing caches the table.
+
+Hosts don't build the same floating CA derivation twice, even though its
+output path isn't known until it's built. Nix locks `<drv>.<output>` for
+it instead, and that lock file is on NFS, next to the derivation.
+
+The cluster test builds a floating CA derivation on every client at once.
+Its output is a random UUID, so each build would get a path of its own.
+Exactly one client built it. The others waited on the lock and then found
+its row, and all three agree on the row. Then a client that didn't build
+it builds a derivation that depends on it, without building it again.
 
 ## Caching
 
@@ -108,6 +136,8 @@ uses the store `local?root=/shared&state=/var/lib/nixremote`. Then:
 - all three build the same derivation at the same time. Its output lock
   is a file on NFS, so exactly one builds it, and the others wait and
   then find it valid;
+- all three build the same floating CA derivation at the same time, with
+  the same outcome (see "CA derivations" above);
 - one client builds a derivation over every client's output without
   rebuilding any of them;
 - every client agrees on the closure and verifies the store's contents;
@@ -429,10 +459,16 @@ test/ci-host.sh verify
 
 - Registering paths still costs a few round trips per path, mostly Nix
   asking whether each path is valid yet. Those answers can't be cached.
-- The service stores its tables in SQLite, not Postgres.
-- CA derivations (`BuildTraceV3`) are unsupported. With `ca-derivations`
-  enabled, Nix fails to open the store rather than keep that table locally
-  on one host.
+- The service stores its tables in SQLite, not Postgres, in one process.
+- A Nix process or host frozen for longer than the NFS lease, between the
+  lock check and moving its output in, could still overwrite another
+  host's files (see "How a host tells it lost its lock"). Closing that
+  needs the NFS server to turn away a client whose state it has dropped.
+- Nothing cleans up what a crashed or killed host leaves on the export:
+  a chroot, or files it never registered. They go only when some host
+  builds or adds the same path again, and a chroot whose output is valid
+  never goes. Hosts can't garbage collect (`deletes=deny`), and nothing
+  yet does it centrally.
 - On NFS, only what the cluster test exercises is known to work: build
   locks across hosts, reading what another host wrote, with
   `delegation_watermark=0` on the hosts, and carrying on after a host
