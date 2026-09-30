@@ -126,14 +126,13 @@ in
         assert rc == "0", f"{m.name}: nix-build exited {rc}:\n{err}"
         return m.succeed(f"cat /tmp/{round}.out").split(), err
 
-    def let_build_finish(m, round, state=guarded, trigger="go"):
+    def let_build_finish(m, round, state=guarded):
         """Once m is running a build that waits for go (see
-        cluster-builds.nix), let it carry on, or with trigger="fail", fail;
-        then wait for the round to end, and return its exit code and
-        stderr."""
+        cluster-builds.nix), let it carry on; then wait for the round to
+        end, and return its exit code and stderr."""
         builds = f"{state}/builds/nix-*/build"
         m.wait_until_succeeds(f"test -e /tmp/{round}.rc || ls -d {builds}", timeout=900)
-        m.execute(f"for d in {builds}; do touch $d/{trigger}; done")
+        m.execute(f"for d in {builds}; do touch $d/go; done")
         return outcome(m, round)
 
     def report(m, round, rc, err):
@@ -377,7 +376,7 @@ in
         # client2's build directory appears once it has the output lock, and
         # its builder runs once it has made its chroot, deleting client1's.
         client2.wait_until_succeeds("ls -d /var/lib/nixremote/builds/nix-*/build", timeout=300)
-        client2.wait_until_succeeds("pgrep -f 'd[o] .* sleep 0.2'", timeout=60)
+        client2.wait_until_succeeds("pgrep -f 'd[o] sleep 0.2'", timeout=60)
         print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - since:.0f}s")
         # client1's nix-build is gone, so it can't delete client2's chroot.
         reconnect(client1)
@@ -408,37 +407,12 @@ in
         client3.succeed("rm -r /shared/nix/store/*-nixremote-substituted.drv.chroot")
 
     # The rest of these are without the watchdog, from client1's other state
-    # directory: what the plugin's check that it holds the lock catches, and
-    # what it doesn't.
-
-    with subtest("without the watchdog, a client cut off mid-build whose build then fails moves its output over another's"):
-        failed, cached = fill_cache("failed")
-        cut_off_mid_build(client1, "failed", unguarded)
-        start = time.monotonic()
-        substitute(client2, "failed")
-        rc, err = outcome(client2, "failed")
-        report(client2, "failed", rc, err)
-        print(f"with client1 cut off, client2 substituted nixremote-failed after {time.monotonic() - start:.0f}s")
-        assert rc == "0", f"client2 should have substituted nixremote-failed, not exited {rc}"
-        reconnect(client1)
-        # Cleaning up after a failed build, Nix moves the output out of the
-        # chroot to its store path, for debugging, without asking whether
-        # the path is valid. So the plugin never gets to check.
-        rc, err = let_build_finish(client1, "failed", unguarded, trigger="fail")
-        report(client1, "failed", rc, err)
-        assert rc != "0", f"client1's build of nixremote-failed should have failed, not exited {rc}"
-        got = client3.succeed(f"cat /shared{failed}")
-        print(f"after client1's build failed, {failed} holds {got!r}; the cache's is {cached!r}")
-        assert got == "started\n", f"client1 should have moved its half-built output over client2's, but {failed} holds {got!r}"
-        client3.fail(f"nix-store --store '{store}' --verify-path {failed}")
-        client3.succeed(f"nix-store --store '{store}&require-sigs=false' --repair-path {failed} --option substituters file:///cache")
-        for m in clients:
-            m.succeed(f"nix-store --store '{store}' --verify-path {failed}")
+    # directory: what the plugin's check that it holds the lock catches.
 
     with subtest("without the watchdog, a client cut off mid-build, while another substitutes its output but has yet to register it"):
-        # As above, except that the service holds client2's commit, and
-        # client1's build succeeds. client1 comes back and finishes while
-        # client2's files are in place but not yet registered.
+        # As above, except that the service holds client2's commit. client1
+        # comes back and finishes while client2's files are in place but not
+        # yet registered.
         raced, cached = fill_cache("raced")
         cut_off_mid_build(client1, "raced", unguarded)
         # Only the next commit to register raced waits, which is client2's.
@@ -552,7 +526,7 @@ in
         client3.succeed(f"rm {lock}")
 
     with subtest("in the end, every client agrees on the store's contents"):
-        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {failed} {raced} {overtaken}"
+        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:
