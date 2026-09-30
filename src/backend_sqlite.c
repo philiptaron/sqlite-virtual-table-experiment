@@ -52,7 +52,17 @@ static const char schema[] =
   "  primary key (drv, id),"
   "  foreign key (drv) references ValidPaths(id) on delete cascade"
   ");"
-  "create index if not exists IndexDerivationOutputs on DerivationOutputs(path);";
+  "create index if not exists IndexDerivationOutputs on DerivationOutputs(path);"
+  /* Nix's has only an index on (drvPath, outputName), but a second row for
+     one derivation output is what two hosts racing to register it make. */
+  "create table if not exists BuildTraceV3 ("
+  "  id integer primary key autoincrement not null,"
+  "  drvPath text not null,"
+  "  outputName text not null,"
+  "  outputPath text not null,"
+  "  signatures text,"
+  "  unique (drvPath, outputName)"
+  ");";
 
 static int set_err(sqlite_backend *b, int rc) {
   return nr_fail(&b->base, rc, "%s", sqlite3_errmsg(b->db));
@@ -196,7 +206,7 @@ static int sqlite_insert(nr_backend *base, const struct nr_table *t, sqlite3_val
                          sqlite3_int64 *rowid) {
   sqlite_backend *b = (sqlite_backend *)base;
   sqlite3_int64 id = 0;
-  if (t->rowid_col >= 0) {
+  if (t->path_keyed) {
     id = nr_path_id((const char *)sqlite3_value_text(cols[1]));
     if (id < 0)
       return nr_fail(base, SQLITE_CONSTRAINT, "\"%s\" is not a store path", sqlite3_value_text(cols[1]));
@@ -215,15 +225,17 @@ static int sqlite_insert(nr_backend *base, const struct nr_table *t, sqlite3_val
   if (rc != SQLITE_OK)
     return rc;
   for (int i = 0; i < t->ncols; i++) {
-    if (i == t->rowid_col)
+    if (i == t->rowid_col && t->path_keyed)
       sqlite3_bind_int64(stmt, i + 1, id);
+    else if (i == t->rowid_col)
+      sqlite3_bind_null(stmt, i + 1);
     else
       sqlite3_bind_value(stmt, i + 1, cols[i]);
   }
   rc = run(b, stmt);
   if (rc == SQLITE_OK)
-    *rowid = t->rowid_col >= 0 ? id : sqlite3_last_insert_rowid(b->db);
-  if (rc == SQLITE_CONSTRAINT_PRIMARYKEY && t->rowid_col >= 0)
+    *rowid = t->path_keyed ? id : sqlite3_last_insert_rowid(b->db);
+  if (rc == SQLITE_CONSTRAINT_PRIMARYKEY && t->path_keyed)
     rc = explain_id_conflict(b, id, (const char *)sqlite3_value_text(cols[1]));
   return rc;
 }

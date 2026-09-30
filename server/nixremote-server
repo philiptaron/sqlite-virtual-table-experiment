@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 The nixremote metadata service: holds the Nix store tables (ValidPaths,
-Refs, DerivationOutputs) for every host that shares a store, and applies
-each host's transaction atomically.
+Refs, DerivationOutputs, and for CA derivations BuildTraceV3) for every
+host that shares a store, and applies each host's transaction atomically.
 
 This is a reference implementation over SQLite. The protocol, described
 in src/backend_http.c, is the contract; a Postgres-backed service can
@@ -66,6 +66,19 @@ create table if not exists DerivationOutputs (
     foreign key (drv) references ValidPaths(id) on delete cascade
 );
 create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
+-- For CA derivations (ca-specific-schema.sql): what each derivation output
+-- was built as. Nix's has only an index on (drvPath, outputName), but a
+-- second row for the same output is what two hosts racing to register it
+-- would make; this way the second gets a conflict, and Nix, retrying,
+-- finds the first.
+create table if not exists BuildTraceV3 (
+    id integer primary key autoincrement not null,
+    drvPath text not null,
+    outputName text not null,
+    outputPath text not null,
+    signatures text,
+    unique (drvPath, outputName)
+);
 create table if not exists Meta (key text primary key, value integer not null);
 insert or ignore into Meta values ('epoch', 0);
 -- The ids of recent commits, so that one a host sends again, not knowing
@@ -78,6 +91,8 @@ TABLES = {
     "ValidPaths": {
         "cols": ["id", "path", "hash", "registrationTime", "deriver", "narSize", "ultimate", "sigs", "ca"],
         "key": "id",
+        # The id is path_id(path) rather than the next number.
+        "path_keyed": True,
         "indexed": {"id", "path"},
         "ordered": {"path"},
         "upsert": False,
@@ -95,6 +110,13 @@ TABLES = {
         "indexed": {"drv", "path"},
         "ordered": set(),
         "upsert": True,
+    },
+    "BuildTraceV3": {
+        "cols": ["id", "drvPath", "outputName", "outputPath", "signatures"],
+        "key": "id",
+        "indexed": {"id", "drvPath"},
+        "ordered": set(),
+        "upsert": False,
     },
 }
 
@@ -431,7 +453,9 @@ class Store:
                 raise BadRequest(f"{name} has {len(cols)} columns")
 
         if kind == "insert":
-            if key:
+            if key and not t.get("path_keyed"):
+                values = [None] + values[1:]
+            elif key:
                 path = values[1]
                 id_ = path_id(path)
                 if id_ is None:
@@ -446,8 +470,14 @@ class Store:
             execute(conn, f"{verb} into {name} ({', '.join(cols)}) values ({', '.join('?' * len(cols))})", values)
         elif kind == "update":
             id_ = op.get("id")
-            if path_id(values[1]) != id_:
+            if t.get("path_keyed") and path_id(values[1]) != id_:
                 raise Invalid("a store path's id and path cannot change")
+            if name == "BuildTraceV3":
+                # Nix only adds signatures. Another output path for the same
+                # derivation output is another build's.
+                row = conn.execute("select drvPath, outputName, outputPath from BuildTraceV3 where id = ?", (id_,)).fetchone()
+                if row and list(row) != values[1:4]:
+                    raise Invalid(f"{row[0]}^{row[1]} was built as {row[2]}, not {values[3]}")
             if name == "ValidPaths":
                 # A host that registers a path it finds valid updates its
                 # row, whether or not its files are the ones registered:

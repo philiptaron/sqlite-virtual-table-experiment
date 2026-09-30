@@ -50,18 +50,20 @@ mkdir -p "$state/db"
 args="backend='${backend//\'/\'\'}', deletes=$deletes, lease=$lease"
 
 # SchemaMigrations stays a real (local, constant) table. Listing the
-# migrations Nix knows about keeps it from trying to run them here; the
-# CA-derivations one is deliberately absent, so enabling ca-derivations
-# fails loudly instead of creating a host-local BuildTraceV3 table.
+# migrations Nix knows about keeps it from trying to run them here,
+# including the CA-derivations one, which would otherwise try to create
+# BuildTraceV3 here and index it.
 sqlite3 "$db" <<EOF
 .bail on
 .load $lib sqlite3_nixremote_init
 pragma journal_mode = wal;
 create table SchemaMigrations (migration text primary key not null);
 insert into SchemaMigrations values ('20260309-drop-redundant-indexreferrer');
+insert into SchemaMigrations values ('20251017-ca-derivations');
 create virtual table ValidPaths using nixremote($args);
 create virtual table Refs using nixremote($args);
 create virtual table DerivationOutputs using nixremote($args);
+create virtual table BuildTraceV3 using nixremote($args);
 EOF
 
 # Nix's schema version (nixSchemaVersion). Matching it means Nix opens the

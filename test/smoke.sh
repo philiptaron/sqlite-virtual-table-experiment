@@ -237,6 +237,31 @@ SQL
     ok "and its path is valid" || not_ok "the replayed commit's path isn't valid"
 fi
 
+echo "# CA derivations' build trace"
+# sql HOST STATEMENT: run STATEMENT on HOST's db.sqlite.
+sql() {
+  sqlite3 "$work/$1/db/db.sqlite" 2>&1 <<SQL
+.load $lib sqlite3_nixremote_init
+$2
+SQL
+}
+where="where drvPath = '$drv' and outputName = 'out'"
+nixr nix path-info --store "$a" --extra-experimental-features ca-derivations "$top" >/dev/null 2>"$work/ca.err" &&
+  ok "Nix opens the store with ca-derivations" || { not_ok "opening the store with ca-derivations"; sed 's/^/     /' "$work/ca.err"; }
+sql a "insert into BuildTraceV3 (drvPath, outputName, outputPath, signatures) values ('$drv', 'out', '$top', '');" >"$work/trace.out"
+[[ $(sql b "select outputPath from BuildTraceV3 $where;") == "$top" ]] &&
+  ok "host b sees host a's realisation" || { not_ok "host b's view of host a's realisation"; sed 's/^/     /' "$work/trace.out"; }
+sql b "insert into BuildTraceV3 (drvPath, outputName, outputPath, signatures) values ('$drv', 'out', '$top', '');" >"$work/trace.out" || true
+grep -Eq 'registered concurrently|HTTP 409' "$work/trace.out" &&
+  ok "registering it again is SQLITE_BUSY" || { not_ok "registering a realisation twice"; sed 's/^/     /' "$work/trace.out"; }
+sql b "update BuildTraceV3 set signatures = 'smoke:sig' $where;" >"$work/trace.out" && [[ $(sql a "select signatures from BuildTraceV3 $where;") == smoke:sig ]] &&
+  ok "its signatures can change" || { not_ok "changing a realisation's signatures"; sed 's/^/     /' "$work/trace.out"; }
+if [[ $backend == http* ]]; then
+  sql b "update BuildTraceV3 set outputPath = '$(head -n1 <<<"$closure")' $where;" >"$work/trace.out" || true
+  grep -q 'was built as' "$work/trace.out" && [[ $(sql a "select outputPath from BuildTraceV3 $where;") == "$top" ]] &&
+    ok "its output path can't" || { not_ok "changing a realisation's output path"; sed 's/^/     /' "$work/trace.out"; }
+fi
+
 echo "# a path registered behind Nix's back reads as a retryable conflict"
 sqlite3 "$work/b/db/db.sqlite" >"$work/conflict.out" 2>&1 <<EOF || true
 .load $lib sqlite3_nixremote_init

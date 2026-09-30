@@ -103,7 +103,7 @@ static int xConnect(sqlite3 *db, void *aux, int argc, const char *const *argv,
                     sqlite3_vtab **out, char **err) {
   (void)aux;
   const struct nr_table *table = NULL;
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < NR_NTABLES; i++)
     if (sqlite3_stricmp(argv[2], nr_tables[i]->name) == 0)
       table = nr_tables[i];
   if (!table) {
@@ -312,23 +312,24 @@ static int xUpdate(sqlite3_vtab *p, int argc, sqlite3_value **argv, sqlite3_int6
   } else if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
     if (t->rowid_col >= 0 && (sqlite3_value_type(argv[1]) != SQLITE_NULL ||
                               sqlite3_value_type(argv[2 + t->rowid_col]) != SQLITE_NULL))
-      return fail(vt, SQLITE_CONSTRAINT, "nixremote: %s ids are derived from the store path and cannot be given", t->name);
+      return fail(vt, SQLITE_CONSTRAINT, "nixremote: %s ids are nixremote's to assign and cannot be given", t->name);
     if (t == &nr_valid_paths && (rc = fence(vt, (const char *)sqlite3_value_text(argv[3]))) != SQLITE_OK)
       return rc;
     rc = nr_insert(b, t, argv + 2, rowid);
-    /* Another host registered the path between Nix's isValidPath check and
-       this insert. Nix retries on SQLITE_BUSY, and on the retry it will
-       see the path as valid and update it instead. */
-    if (rc == SQLITE_CONSTRAINT_UNIQUE && t == &nr_valid_paths)
+    /* Another host registered the path, or the derivation output, between
+       Nix's check and this insert. Nix retries on SQLITE_BUSY, and on the
+       retry it will see the row and update it instead. */
+    if (rc == SQLITE_CONSTRAINT_UNIQUE && t->rowid_col >= 0)
       return fail(vt, SQLITE_BUSY, "nixremote: %s was registered concurrently; retrying",
                   sqlite3_value_text(argv[3]));
   } else {
     if (t->rowid_col < 0)
       return fail(vt, SQLITE_CONSTRAINT, "nixremote: %s rows cannot be updated", t->name);
     if (sqlite3_value_int64(argv[0]) != sqlite3_value_int64(argv[1]) ||
-        sqlite3_value_int64(argv[0]) != nr_path_id((const char *)sqlite3_value_text(argv[3])))
-      return fail(vt, SQLITE_CONSTRAINT, "nixremote: a store path's id and path cannot change");
-    if ((rc = fence(vt, (const char *)sqlite3_value_text(argv[3]))) != SQLITE_OK)
+        (t->path_keyed &&
+         sqlite3_value_int64(argv[0]) != nr_path_id((const char *)sqlite3_value_text(argv[3]))))
+      return fail(vt, SQLITE_CONSTRAINT, "nixremote: a %s row's id and key cannot change", t->name);
+    if (t == &nr_valid_paths && (rc = fence(vt, (const char *)sqlite3_value_text(argv[3]))) != SQLITE_OK)
       return rc;
     rc = nr_update(b, t, sqlite3_value_int64(argv[0]), argv + 2);
   }

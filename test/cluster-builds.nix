@@ -10,18 +10,30 @@
 }:
 let
   bb = builtins.storePath busybox;
-  mk =
-    name: script:
-    derivation {
-      inherit name;
-      system = builtins.currentSystem;
-      builder = "${bb}/bin/sh";
-      args = [
-        "-ec"
-        script
-      ];
-      PATH = "${bb}/bin";
-    };
+  mkWith =
+    attrs: name: script:
+    derivation (
+      {
+        inherit name;
+        system = builtins.currentSystem;
+        builder = "${bb}/bin/sh";
+        args = [
+          "-ec"
+          script
+        ];
+        PATH = "${bb}/bin";
+      }
+      // attrs
+    );
+  mk = mkWith { };
+  # Content-addressed, and floating: its path comes from what it builds.
+  # Needs the ca-derivations experimental feature.
+  mkCA = mkWith {
+    __contentAddressed = true;
+    outputHashMode = "recursive";
+    outputHashAlgo = "sha256";
+  };
+  ca = mkCA "nixremote-ca" "sleep 10; cat /proc/sys/kernel/random/uuid > $out";
   own = name: mk "nixremote-${name}" "cat ${shared} > $out; echo ${name} >> $out";
   shared = mk "nixremote-shared" "sleep 10; echo shared > $out";
   waiting =
@@ -52,6 +64,12 @@ in
   substituted = waiting "substituted";
   raced = waiting "raced";
   overtaken = waiting "overtaken";
+  # Every client builds this at once. Its output is random, so each build
+  # would have a path of its own: exactly one should build it, and the
+  # others find what it was built as.
+  inherit ca;
+  # Built on one client from ca's output, without building ca again.
+  ca-user = mkCA "nixremote-ca-user" "cat ${ca} > $out";
   # Built while the NFS server restarts.
   nfsrestart = waiting "nfsrestart";
 }
