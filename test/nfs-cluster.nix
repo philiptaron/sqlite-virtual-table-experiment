@@ -315,6 +315,27 @@ in
             got = m.succeed(f"cat /shared{combined}")
             assert got == want, f"{m.name} reads {got!r} from {combined}, want {want!r}"
 
+    with subtest("clients building the same CA derivation at once build it once, and agree on what it was built as"):
+        ca = "--extra-experimental-features ca-derivations"
+        results = build_everywhere("ca", f"-A ca {ca}")
+        outs = {out[0] for out, _ in results.values()}
+        assert len(outs) == 1, f"clients disagree on nixremote-ca's output: {outs}"
+        [ca_out] = outs
+        builders = [name for name, (_, err) in results.items() if "nixremote-ca" in built(err)]
+        assert len(builders) == 1, f"nixremote-ca was built by {builders}, want exactly one client"
+        drv = client1.succeed(f"nix-store --store '{store}' -q --deriver {ca_out}").strip()
+        traces = {m.name: m.succeed(f"nix realisation info --store '{store}' {ca} --json '{drv}^out'") for m in clients}
+        print(f"{drv}^out: {traces['client1']}")
+        assert len(set(traces.values())) == 1 and ca_out in traces["client1"], f"clients disagree on what {drv}^out was built as: {traces}"
+        other = next(m for m in clients if m.name not in builders)
+        other.succeed(f"/run/current-system/sw/bin/cluster-build ca-user -A ca-user {ca}")
+        [ca_user], err = finished(other, "ca-user")
+        assert built(err) == ["nixremote-ca-user"], f"{other.name} built {built(err)}, want only nixremote-ca-user:\n{err}"
+        want = other.succeed(f"cat /shared{ca_out}")
+        for m in clients:
+            got = m.succeed(f"cat /shared{ca_user}")
+            assert got == want, f"{m.name} reads {got!r} from {ca_user}, want {want!r}"
+
     with subtest("and then no client builds anything"):
         client1.succeed("/run/current-system/sw/bin/cluster-build again -A combined")
         _, err = finished(client1, "again")
@@ -609,7 +630,7 @@ in
             m.succeed(f"nix-store --store '{store}' --verify-path {nfsrestart}")
 
     with subtest("in the end, every client agrees on the store's contents"):
-        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken} {replayed} {nfsrestart}"
+        paths = f"{combined} {ca_out} {ca_user} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken} {replayed} {nfsrestart}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:

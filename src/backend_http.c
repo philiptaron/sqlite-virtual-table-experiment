@@ -81,7 +81,7 @@ typedef struct {
   int nops;
   unsigned written;           /* bit i: nr_tables[i] was written in this transaction */
   int deleted;                /* ...and a ValidPaths row was deleted, cascading */
-  sqlite3_int64 next_rowid;   /* for Refs and DerivationOutputs, whose rowids Nix ignores */
+  sqlite3_int64 next_rowid;   /* for the tables whose new rowids Nix ignores */
 } http_backend;
 
 typedef struct {
@@ -108,7 +108,7 @@ static const char mem_schema[] =
   "create table cache_outputs (drv, id, path, primary key (drv, id));";
 
 static unsigned table_bit(const struct nr_table *t) {
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < NR_NTABLES; i++)
     if (nr_tables[i] == t)
       return 1u << i;
   return 0;
@@ -542,7 +542,7 @@ static int http_insert(nr_backend *base, const struct nr_table *t, sqlite3_value
   if (rc != SQLITE_OK)
     return rc;
   sqlite3_int64 id = ++h->next_rowid;
-  if (t->rowid_col >= 0) {
+  if (t->path_keyed) {
     id = nr_path_id((const char *)sqlite3_value_text(cols[1]));
     if (id < 0)
       return nr_fail(base, SQLITE_CONSTRAINT, "\"%s\" is not a store path", sqlite3_value_text(cols[1]));
@@ -562,7 +562,7 @@ static int http_update(nr_backend *base, const struct nr_table *t, sqlite3_int64
                        sqlite3_value **cols) {
   http_backend *h = (http_backend *)base;
   int rc = require_txn(h);
-  if (rc != SQLITE_OK || (rc = put_pending(h, rowid, cols)) != SQLITE_OK)
+  if (rc != SQLITE_OK || (t == &nr_valid_paths && (rc = put_pending(h, rowid, cols)) != SQLITE_OK))
     return rc;
   sqlite3_str *s = add_op(h, "update", t);
   sqlite3_str_appendf(s, ",\"id\":%lld,\"cols\":", rowid);

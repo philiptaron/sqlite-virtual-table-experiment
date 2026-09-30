@@ -20,6 +20,7 @@ const struct nr_table nr_valid_paths = {
   .ncols = 9,
   .cols = valid_paths_cols,
   .rowid_col = 0,
+  .path_keyed = 1,
   .indexed = 1u << 0 | 1u << 1,
   .unique = 1u << 0 | 1u << 1,
   .ordered = 1u << 1,
@@ -47,8 +48,21 @@ const struct nr_table nr_derivation_outputs = {
   .upsert = 1,
 };
 
-const struct nr_table *const nr_tables[3] = {
-  &nr_valid_paths, &nr_refs, &nr_derivation_outputs,
+/* What each CA derivation output was built as. Nix looks a row up by
+   drvPath and outputName, and only ever changes its signatures. */
+static const char *const build_trace_cols[] = { "id", "drvPath", "outputName", "outputPath", "signatures" };
+const struct nr_table nr_build_trace = {
+  .name = "BuildTraceV3",
+  .decl = "CREATE TABLE x(id INTEGER, drvPath TEXT, outputName TEXT, outputPath TEXT, signatures TEXT)",
+  .ncols = 5,
+  .cols = build_trace_cols,
+  .rowid_col = 0,
+  .indexed = 1u << 0 | 1u << 1,
+  .unique = 1u << 0,
+};
+
+const struct nr_table *const nr_tables[NR_NTABLES] = {
+  &nr_valid_paths, &nr_refs, &nr_derivation_outputs, &nr_build_trace,
 };
 
 static const char nix_base32[] = "0123456789abcdfghijklmnpqrsvwxyz";

@@ -12,21 +12,24 @@
 
 #include <sqlite3ext.h>
 
-/* The three tables of Nix's store schema (src/libstore/schema.sql). */
+/* The tables of Nix's store schema (src/libstore/schema.sql), and the one
+   CA derivations add (ca-specific-schema.sql). */
 struct nr_table {
   const char *name;
   const char *decl;        /* for sqlite3_declare_vtab */
   int ncols;
   const char *const *cols;
   int rowid_col;           /* integer key column, or -1 if rows have none */
+  int path_keyed;          /* the key is nr_path_id() of column 1; if not, the backend numbers rows */
   unsigned indexed;        /* bitmask of columns the backend can look up by equality */
   unsigned unique;         /* ...of which these are unique */
   unsigned ordered;        /* ...and these can be scanned from a lower bound */
   int upsert;              /* Nix writes this table with "insert or replace" */
 };
 
-extern const struct nr_table nr_valid_paths, nr_refs, nr_derivation_outputs;
-extern const struct nr_table *const nr_tables[3];
+#define NR_NTABLES 4
+extern const struct nr_table nr_valid_paths, nr_refs, nr_derivation_outputs, nr_build_trace;
+extern const struct nr_table *const nr_tables[NR_NTABLES];
 
 enum nr_op { NR_SCAN, NR_EQ, NR_GE };
 
@@ -96,7 +99,10 @@ static inline void nr_rows_close(nr_rows *rows) {
 }
 
 /* cols has t->ncols entries. For ValidPaths the backend ignores cols[0] and
- * assigns nr_path_id(path); *rowid receives the new row's key. */
+ * assigns nr_path_id(path); *rowid receives the new row's key. BuildTraceV3
+ * rows are numbered by the backend, and a backend that numbers them only
+ * once the transaction commits makes one up for *rowid, which Nix never
+ * reads. */
 static inline int nr_insert(nr_backend *b, const struct nr_table *t, sqlite3_value **cols,
                             sqlite3_int64 *rowid) {
   return b->ops->insert(b, t, cols, rowid);
