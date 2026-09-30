@@ -171,6 +171,15 @@ in
         """Wait for the watchdog to kill m's nix-build while m is cut off,
         and clear away what it left on m's own disk: its build directory,
         and its builder if that outlived it."""
+        # 40s past the watchdog's deadline, and well before nfsd's lease
+        # runs out; m stays cut off meanwhile, so a process that can't exit
+        # until the network is back would wait forever.
+        if m.execute(f"timeout {max(1, int(since + 100 - time.monotonic()))} sh -c 'until [ -e /tmp/{round}.rc ]; do sleep 1; done'")[0] != 0:
+            print(f"{m.name}'s nix-build is still there {time.monotonic() - since:.0f}s after it was cut off. Its stderr:")
+            print(m.execute(f"cat /tmp/{round}.err")[1])
+            print(m.execute("ps -eLo pid,tid,stat,wchan:32,etimes,args | grep -v ' \\[' ")[1])
+            print(m.execute("for p in $(pgrep -x nix-build; pgrep -x nix); do for t in /proc/$p/task/*; do echo \"== $t: $(cat $t/comm) $(cat $t/wchan)\"; cat $t/stack; done; done")[1])
+            raise AssertionError(f"the watchdog should have killed {m.name}'s nix-build by now")
         rc, err = outcome(m, round)
         report(m, round, rc, err)
         print(f"{m.name}'s nix-build was killed {time.monotonic() - since:.0f}s after it was cut off")
