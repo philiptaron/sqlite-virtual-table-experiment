@@ -167,26 +167,38 @@ in
         cut_off(m)
         return time.monotonic()
 
+    # A shell test that each thread of every nix-build has exited, or is in
+    # the kernel on its way out. No single quotes, to go inside sh -c '...'.
+    exiting = ("for p in $(pgrep -x nix-build); do for t in /proc/$p/task/*; do "
+               "read -r _ _ st _ <$t/stat; [ $st = Z ] || grep -q do_exit $t/stack || exit 1; done; done")
+
     def killed(m, round, since, state=guarded):
         """Wait for the watchdog to kill m's nix-build while m is cut off,
         and clear away what it left on m's own disk: its build directory,
-        and its builder if that outlived it."""
-        # 40s past the watchdog's deadline, and well before nfsd's lease
-        # runs out; m stays cut off meanwhile, so a process that can't exit
-        # until the network is back would wait forever.
-        if m.execute(f"timeout {max(1, int(since + 100 - time.monotonic()))} sh -c 'until [ -e /tmp/{round}.rc ]; do sleep 1; done'")[0] != 0:
-            print(f"{m.name}'s nix-build is still there {time.monotonic() - since:.0f}s after it was cut off. Its stderr:")
-            print(m.execute(f"cat /tmp/{round}.err")[1])
-            print(m.execute("ps -eLo pid,tid,stat,wchan:32,etimes,args | grep -v ' \\[' ")[1])
-            print(m.execute("for p in $(pgrep -x nix-build; pgrep -x nix); do for t in /proc/$p/task/*; do echo \"== $t: $(cat $t/comm) $(cat $t/wchan)\"; cat $t/stack; done; done")[1])
-            raise AssertionError(f"the watchdog should have killed {m.name}'s nix-build by now")
-        rc, err = outcome(m, round)
-        report(m, round, rc, err)
+        and its builder if that outlived it.
+
+        Exiting closes the lock file, which unlocks it: an NFS request, and
+        the thread doing that waits for the answer, which can't come until
+        m is back. (Unless m holds a delegation for the file, when the
+        unlock is local.) So the process may not be gone yet, only past the
+        point where it could run anything of Nix's."""
+        m.wait_until_succeeds(f"grep -q 'no answer from the NFS server' /tmp/{round}.err", timeout=100)
         print(f"{m.name}'s nix-build was killed {time.monotonic() - since:.0f}s after it was cut off")
-        assert rc == "137" and "no answer from the NFS server" in err, f"the watchdog should have killed {m.name}'s nix-build, not let it exit {rc}"
+        if m.execute(f"timeout 20 sh -c 'until [ -e /tmp/{round}.rc ] || ({exiting}); do sleep 1; done'")[0] != 0:
+            print(m.execute("timeout 10 ps -eLo pid,tid,stat,wchan:32,etimes,args | grep -v ' \\['")[1])
+            print(m.execute("for p in $(pgrep -x nix-build); do for t in /proc/$p/task/*; do echo \"== $t: $(cat $t/comm)\"; timeout 5 cat $t/stack; done; done")[1])
+            raise AssertionError(f"{m.name}'s nix-build should have been exiting by now")
+        waiting = m.execute(f"test -e /tmp/{round}.rc")[0] != 0
+        print(f"{m.name}'s nix-build {'is waiting to unlock its lock file' if waiting else 'has exited'}")
         survivors = m.execute("pgrep -af '[s]leep 0.2'")[1].strip()
         print(f"{m.name}'s builder {'outlived it: ' + survivors if survivors else 'died with it'}")
         m.execute(f"pkill -f '[s]leep 0.2'; rm -rf {state}/builds/nix-*")
+
+    def reaped(m, round):
+        """Once m is back, check that its nix-build was killed."""
+        rc, err = outcome(m, round)
+        report(m, round, rc, err)
+        assert rc == "137", f"the watchdog should have killed {m.name}'s nix-build, not let it exit {rc}"
 
     def fill_cache(name):
         """Build name in a store of client3's own, and copy it to the binary
@@ -389,6 +401,7 @@ in
         print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - since:.0f}s")
         # client1's nix-build is gone, so it can't delete client2's chroot.
         reconnect(client1)
+        reaped(client1, "cutoff")
         rc, err = let_build_finish(client2, "cutoff")
         report(client2, "cutoff", rc, err)
         assert rc == "0", f"client2's build of nixremote-cutoff should have succeeded, not exited {rc}"
@@ -406,6 +419,7 @@ in
         print(f"with client1 cut off, client2 substituted nixremote-substituted after {time.monotonic() - since:.0f}s")
         assert rc == "0" and built(err) == [], "client2 should have substituted nixremote-substituted, not built it"
         reconnect(client1)
+        reaped(client1, "substituted")
         for m in clients:
             got = m.succeed(f"cat /shared{substituted}")
             assert got == cached, f"{m.name} reads {got!r} from {substituted}, not the cache's {cached!r}"
