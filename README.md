@@ -204,9 +204,8 @@ Two things follow:
   can't delete (`deletes=deny`). `test/ci-host.sh verify` fails on any it
   finds.
 - A shorter lease (`lease-time` in `/etc/nfs.conf`, 10 seconds at least)
-  shortens the wait. It also means a host cut off from the server for
-  longer than that loses its locks while it may still be building, which
-  goes wrong in the ways below.
+  shortens the wait. The hosts' `lease=` has to shrink with it, so that
+  one cut off from the server stops sooner too (see below).
 
 ### A host that's cut off
 
@@ -216,49 +215,85 @@ to come back, but its build directory is local. After the lease, nfsd
 gives its locks to the next host that asks. When the network comes back,
 its NFS client reopens by file handle the files that still exist, and
 marks the lock lost (`recover_lost_locks` is off). Nix never touches its
-lock file during a build, so it never learns that the lock is gone, but
-the plugin checks for it (below).
+lock file during a build, so it never learns that the lock is gone.
+
+So the plugin stops it first (`src/lock.c`). Every request a host sends
+the server renews its lease, for at least a lease from when it was sent.
+In each Nix process that holds a lock on NFS, one thread asks the server
+for `statfs` of each locked file every two seconds, and another kills the
+process with SIGKILL once none of those has been answered for two thirds
+of the lease: 60 seconds of nfsd's 90. The process is gone half a minute
+before the server could give its locks away, and it does nothing once
+the network is back, much as if the host had crashed (see above). It's
+SIGKILL because cleaning up is exactly what the process mustn't do. The
+lease is the `lease=` module argument, which `nixremote-mkstate --lease`
+sets, 90 by default; it must be no longer than the server's `lease-time`.
+`--lease 0` turns the watchdog off.
 
 The test cuts client1 off (iptables drops everything to and from the
 host) while it builds a derivation that waits for a local file partway
 through, and lets each build carry on in turn. Every build of these
 writes a random last line, so it's plain whose output ended up where.
 
-- **Another host builds the same derivation.** client2 gets the lock
-  after 106 seconds and deletes client1's chroot to make its own. When
-  client1 comes back, its builder fails (`Stale file handle`). Cleaning
-  up, client1 deletes `<drv>.chroot` by its path, which is client2's
-  chroot now, so client2's builder fails the same way. client3 then
-  builds it. Two builds are lost, and nothing is corrupted.
-- **Another host substitutes the output.** client2 gets the path from the
-  binary cache after 104 seconds; substituting needs no chroot, so
-  client1's survives. When client1 comes back, its build finishes. Nix
-  goes to register the output, finds it valid, which it expects only of
-  CA derivations, and aborts on `assert(newInfo.ca)`
-  (`derivation-builder.cc`). That assertion is all that stops it moving
-  its own output over the one client2 substituted. The abort skips
-  cleanup, so client1's chroot stays on the export for good: the path is
-  valid, so no one will build it again. The test deletes it.
+- **For less than the deadline.** Cut off for 20 seconds, client1 carries
+  on, and its build finishes.
+- **Another host builds the same derivation.** The watchdog kills
+  client1's nix-build 60 seconds in, and its builder dies with it. client2
+  gets the lock after 105 seconds, deletes client1's chroot to make its
+  own, and builds it.
+- **Another host substitutes the output.** The same, except that client2
+  gets the path from the binary cache. client1's chroot stays on the
+  export for good, as a crashed host's would: the path is valid, so no
+  one will build it again. The test deletes it.
+
+Before the watchdog, client1 carried on once it was back, and:
+
+- **building the same derivation**, found its chroot gone, so its builder
+  failed (`Stale file handle`). Cleaning up, client1 deleted
+  `<drv>.chroot` by its path, which was client2's chroot by then, so
+  client2's builder failed the same way. Two builds were lost.
+- **substituting**, finished its build, and went to register its output.
+  Nix found it valid, which it expects only of CA derivations, and
+  aborted on `assert(newInfo.ca)` (`derivation-builder.cc`). That
+  assertion was all that stopped it moving its own output over the one
+  client2 substituted.
+- **whose build fails**, would move its half-built output out of the
+  chroot to the store path, for debugging, over whatever another host put
+  there, without asking whether the path is valid. The test can't show
+  it: Nix looks for the output at the chroot plus the store's real path,
+  `<drv>.chroot/root/shared/nix/store/...`, while the builder wrote it at
+  `<drv>.chroot/root/nix/store/...`, so with the test's store at
+  `/shared` it finds nothing to move. A host that mounts the store at
+  `/nix/store` would move it.
+
+### Without the watchdog
+
+The plugin also checks that its process still holds a path's lock before
+it answers that the path is invalid, and before it registers or changes
+the path (see below). That covers a watchdog that couldn't run: a process
+or a host that was frozen for longer than the lease, or a `lease=` longer
+than the server's. The test checks it from a second state directory on
+client1, made with `nixremote-mkstate --lease 0`, so the watchdog is off:
+
 - **Another host substitutes the output, and hasn't registered it yet.**
-  As above, but the service holds client2's commit, so client1 comes
-  back while client2's files are in place and the path is invalid.
-  client1's build finishes, and it asks whether the path is valid, to
-  decide whether to delete what's there and move its own output in. The
-  plugin finds that client1 lost its lock and fails the query, so
-  client1's build fails, and client2's files stay. client2's commit then
-  goes through.
+  The service holds client2's commit, so client1 comes back while
+  client2's files are in place and the path is invalid. client1's build
+  finishes, and it asks whether the path is valid, to decide whether to
+  delete what's there and move its own output in. The plugin finds that
+  client1 lost its lock and fails the query, so client1's build fails,
+  and client2's files stay. client2's commit then goes through.
 - **Another host registers the output just after this one finds it
   invalid.** The same, except that the service also holds its answer
   to client1 until client2's commit has landed. The plugin gets that the
   path is invalid, finds that client1 lost its lock, and fails the query.
   The outcome is the same.
 
-Without the plugin's check, both corrupt the store. client1 deletes
-client2's files and moves its own in, and the path ends up with client1's
-files and the cache's hash. In the first case, that's because client2's
-commit gets a 409, and on the retry Nix finds the path valid and updates
-the row with its own hash. In the second, client2's commit was the one
-that landed.
+Without the check, both corrupt the store. client1 deletes client2's
+files and moves its own in, and the path ends up with client1's files
+and the cache's hash. In the first case, that's because client2's commit
+gets a 409, and on the retry Nix finds the path valid and updates the row
+with its own hash. In the second, client2's commit was the one that
+landed.
 
 The service refuses any commit that changes a registered path's hash,
 except the all-zero one Nix registers when it doesn't know a path's hash.
@@ -267,6 +302,9 @@ but not the second: there the files move before any commit, and the
 service can't tell whether a host still holds the path's lock. It also
 refuses `--repair` of a derivation that isn't reproducible, which gives
 the path a new hash.
+
+The check doesn't cover a failed build's move (above), a host cut off
+between the check and its move, or a chroot deleted by its path.
 
 ### How a host tells it lost its lock
 
@@ -291,13 +329,20 @@ since that drops all of the process's locks on it.
 
 So the plugin (`src/lock.c`) looks for a path's lock file among its
 process's descriptors in `/proc/self/fd`, and reads each one on NFS with
-`O_DIRECT`. It does this before it answers that a path is invalid, and
-before it registers or changes a path. If a read fails with EIO, the
-query or write fails with `SQLITE_IOERR`, which Nix doesn't retry. That
-costs a scan of `/proc/self/fd` for each lookup that finds no path and
-each write of one, plus a READ for each lock file it finds. It only
-works on Linux. It also leaves a window: a host cut off after the check
-and before it moves its output could still overwrite another's.
+`O_DIRECT`. If a read fails with EIO, or with ESTALE because another
+host has deleted the lock file since, as Nix does once the path is
+valid, the query or write fails with `SQLITE_IOERR`, which Nix doesn't
+retry. It also fails if the watchdog has found the server silent past
+its deadline and not yet killed the process. That costs a scan of
+`/proc/self/fd` for each lookup that finds no path and each write of
+one, plus a READ for each lock file it finds.
+
+The watchdog finds a process's locks in `/proc/self/fdinfo`, which lists
+a descriptor's locks only while they're held. It costs each process that
+holds a lock a `statfs` to the server every two seconds. What it and the
+check leave open is a process or host frozen for longer than the lease
+between the check and the move; a paused VM's clock may not even show
+the pause. Both work only on Linux.
 
 The test is a Nix build that requires the `kvm` feature, and it fails
 unless every VM reports KVM (`systemd-detect-virt`), so it never falls
@@ -332,8 +377,6 @@ test/ci-host.sh verify
 - On NFS, only what the cluster test exercises is known to work: build
   locks across hosts, reading what another host wrote, with
   `delegation_watermark=0` on the hosts, and carrying on after a host
-  crashes (see above). A host that's cut off stops before it overwrites
-  a path another host holds the lock on, on Linux, but only because the
-  plugin checks at the right moment (see above). It still deletes
-  another host's chroot if they build the same derivation. Either server
-  restarting is still ahead.
+  crashes (see above), and a host that's cut off, which kills its Nix
+  processes before another host can take their locks, on Linux (see
+  above). Either server restarting is still ahead.
