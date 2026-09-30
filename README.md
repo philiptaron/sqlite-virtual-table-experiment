@@ -241,6 +241,21 @@ writes a random last line, so it's plain whose output ended up where.
   client1's nix-build 60 seconds in, and its builder dies with it. client2
   gets the lock after 105 seconds, deletes client1's chroot to make its
   own, and builds it.
+
+  The killed process may not be gone yet. Exiting closes the lock file,
+  which unlocks it, and the unlock is an NFS request. The thread doing it
+  waits in the kernel for an answer that can't come until the network is
+  back:
+
+  ```
+  rpc_wait_bit_killable < nfs4_proc_lock < locks_remove_flock
+    < locks_remove_file < __fput < task_work_run < do_exit
+  ```
+
+  It's past running anything of Nix's by then, and the unlock reaches a
+  server that has already dropped the host's state. It happened in about
+  half of the runs; in the others, presumably, the host held a delegation
+  for the lock file, which makes the unlock local.
 - **Another host substitutes the output.** The same, except that client2
   gets the path from the binary cache. client1's chroot stays on the
   export for good, as a crashed host's would: the path is valid, so no
