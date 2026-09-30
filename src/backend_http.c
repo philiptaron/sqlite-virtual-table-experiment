@@ -6,7 +6,8 @@
  *                "order": bool, "limit": N|null, "prefetch": N|null}
  *               -> {"rows": [[...], ...], "epoch": E,
  *                   "prefetch": {"paths": [...], "refs": [...], "outputs": [...]}}
- *   /v1/commit  {"ops": [{"op": "insert", "table": T, "cols": [...]},
+ *   /v1/commit  {"id": ID,
+ *                "ops": [{"op": "insert", "table": T, "cols": [...]},
  *                        {"op": "update", "table": T, "id": N, "cols": [...]},
  *                        {"op": "delete", "table": T, "id": N}]}
  *               -> {"epoch": E}
@@ -14,6 +15,11 @@
  * Failures are {"error": "..."} with status 409 when another host changed
  * something the transaction relied on (SQLITE_BUSY, so Nix retries the
  * whole transaction), 422 for a constraint violation, anything else hard.
+ *
+ * A request whose connection fails, say because the service is
+ * restarting, is sent again for up to `retry` seconds. For a commit, the
+ * service may have applied it and failed only to answer. ID, random and
+ * the same each time the commit is sent, lets the service apply it once.
  *
  * Writes are buffered and sent as one commit from xSync, so a transaction
  * costs no round trips beyond its reads. That works because ValidPaths ids
@@ -32,9 +38,9 @@
  * The cache is dropped when a response carries a new epoch (a commit
  * somewhere deleted or changed a path), when a commit conflicts, and entry
  * by entry after `cache_ttl` seconds; it also lives no longer than the
- * database connection, which is one Nix process or daemon session. Both
- * are URL parameters: http://host:port?cache_ttl=60&prefetch=500, where
- * cache_ttl=0 turns caching off.
+ * database connection, which is one Nix process or daemon session. These
+ * are URL parameters, http://host:port?cache_ttl=60&prefetch=500&retry=60,
+ * where cache_ttl=0 turns caching off.
  *
  * JSON is parsed and quoted by SQLite's JSON functions, run on a private
  * in-memory database that also holds the pending writes and the cache.
@@ -43,6 +49,7 @@
 SQLITE_EXTENSION_INIT3
 
 #include <curl/curl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -67,6 +74,7 @@ typedef struct {
   sqlite3_stmt *quote;        /* select json_quote(?1) */
   int cache_ttl;              /* seconds; 0 disables the cache */
   int prefetch;               /* most paths one lookup brings into the cache */
+  int retry;                  /* seconds to keep sending a request whose connection failed */
   sqlite3_int64 epoch;        /* of the cache's contents */
   int in_txn;
   sqlite3_str *ops;           /* the pending commit's ops, comma separated */
@@ -242,19 +250,41 @@ static char *error_message(http_backend *h, const char *body) {
   return msg ? msg : sqlite3_mprintf("%.200s", body ? body : "empty response");
 }
 
+/* Whether a request that failed this way may be sent again: the service
+   wasn't there, or went away before answering. Not a timeout, as the
+   service may still be working on it. */
+static int retryable(CURLcode cc) {
+  return cc == CURLE_COULDNT_CONNECT || cc == CURLE_SEND_ERROR || cc == CURLE_RECV_ERROR ||
+         cc == CURLE_GOT_NOTHING || cc == CURLE_PARTIAL_FILE;
+}
+
 /* POST body (which this takes ownership of) to the service; on success
  * *response is the response body, to be freed with sqlite3_free. */
 static int post(http_backend *h, const char *path, char *body, char **response) {
   char *url = sqlite3_mprintf("%s%s", h->url, path);
-  sqlite3_str *received = sqlite3_str_new(NULL);
   curl_easy_setopt(h->curl, CURLOPT_URL, url);
   curl_easy_setopt(h->curl, CURLOPT_POSTFIELDS, body ? body : "{}");
   curl_easy_setopt(h->curl, CURLOPT_POSTFIELDSIZE, (long)(body ? strlen(body) : 2));
-  curl_easy_setopt(h->curl, CURLOPT_WRITEDATA, received);
-  CURLcode cc = curl_easy_perform(h->curl);
+  time_t give_up = time(NULL) + h->retry;
+  int pause = 100;
+  CURLcode cc;
+  char *text;
+  for (;;) {
+    sqlite3_str *received = sqlite3_str_new(NULL);
+    curl_easy_setopt(h->curl, CURLOPT_WRITEDATA, received);
+    cc = curl_easy_perform(h->curl);
+    text = sqlite3_str_finish(received);
+    if (cc == CURLE_OK || !retryable(cc) || time(NULL) >= give_up)
+      break;
+    if (pause == 100)
+      fprintf(stderr, "nixremote: %s: %s; trying again for up to %ds\n", url, curl_easy_strerror(cc),
+              h->retry);
+    sqlite3_free(text);
+    sqlite3_sleep(pause);
+    pause = pause * 2 > 2000 ? 2000 : pause * 2;
+  }
   long status = 0;
   curl_easy_getinfo(h->curl, CURLINFO_RESPONSE_CODE, &status);
-  char *text = sqlite3_str_finish(received);
   sqlite3_free(body);
 
   int rc = SQLITE_OK;
@@ -569,15 +599,34 @@ static int http_begin(nr_backend *base) {
   return SQLITE_OK;
 }
 
+/* A commit's id: random, and not from SQLite's generator, which Nix's
+   daemon would share with every process it forks. */
+static int commit_id(http_backend *h, char id[33]) {
+  unsigned char r[16];
+  FILE *f = fopen("/dev/urandom", "rb");
+  size_t n = f ? fread(r, 1, sizeof r, f) : 0;
+  if (f)
+    fclose(f);
+  if (n != sizeof r)
+    return nr_fail(&h->base, SQLITE_IOERR, "cannot read /dev/urandom for a commit id");
+  for (size_t i = 0; i < sizeof r; i++)
+    snprintf(id + 2 * i, 3, "%02x", r[i]);
+  return SQLITE_OK;
+}
+
 /* On failure the pending writes stay put: SQLite follows up with a rollback. */
 static int http_commit(nr_backend *base) {
   http_backend *h = (http_backend *)base;
   if (h->nops > 0) {
+    char id[33];
+    int rc = commit_id(h, id);
+    if (rc != SQLITE_OK)
+      return rc;
     char *ops = sqlite3_str_finish(h->ops);
     h->ops = NULL;
-    char *body = sqlite3_mprintf("{\"ops\":[%s]}", ops ? ops : "");
+    char *body = sqlite3_mprintf("{\"id\":\"%s\",\"ops\":[%s]}", id, ops ? ops : "");
     char *response = NULL;
-    int rc = post(h, "/v1/commit", body, &response);
+    rc = post(h, "/v1/commit", body, &response);
     sqlite3_free(response);
     if (rc != SQLITE_OK) {
       /* Keep the ops for a retried commit, as SQLite allows. */
@@ -627,7 +676,7 @@ static const struct nr_backend_ops http_ops = {
   .rollback = http_rollback,
 };
 
-/* Parse the URL's ?cache_ttl=N&prefetch=N into h. */
+/* Parse the URL's ?cache_ttl=N&prefetch=N&retry=N into h. */
 static int parse_params(http_backend *h, const char *params, char **errmsg) {
   while (params && *params) {
     const char *end = strchr(params, '&');
@@ -641,6 +690,8 @@ static int parse_params(http_backend *h, const char *params, char **errmsg) {
       h->cache_ttl = (int)value;
     else if (ok && strncmp(param, "prefetch=", 9) == 0 && value > 0)
       h->prefetch = (int)value;
+    else if (ok && strncmp(param, "retry=", 6) == 0)
+      h->retry = (int)value;
     else
       ok = 0;
     if (!ok)
@@ -661,6 +712,7 @@ int nr_http_open(const char *uri, nr_backend **out, char **errmsg) {
   h->base.ops = &http_ops;
   h->cache_ttl = 60;
   h->prefetch = 500;
+  h->retry = 60;
   h->epoch = -1;
 
   const char *params = strchr(uri, '?');

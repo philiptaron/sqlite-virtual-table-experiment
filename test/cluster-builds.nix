@@ -52,4 +52,6 @@ in
   substituted = waiting "substituted";
   raced = waiting "raced";
   overtaken = waiting "overtaken";
+  # Built while the NFS server restarts.
+  nfsrestart = waiting "nfsrestart";
 }
