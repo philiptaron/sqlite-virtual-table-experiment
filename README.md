@@ -27,6 +27,10 @@ read and write goes to one metadata service that provides consistency.
   service, written in Python (standard library only) over SQLite. The
   protocol, documented at the top of `src/backend_http.c`, is the contract;
   a Postgres-backed service can replace this one.
+- `src/lock.c`: keeps a Nix process from acting on a store path after
+  another host may have taken its lock: a watchdog that kills a process
+  once its NFS server has been silent for too long, and a check that the
+  process still holds a path's lock (see "A host that's cut off" below).
 - `src/plugin.c`: a Nix plugin (`plugin-files`) that registers the module
   through `sqlite3_auto_extension` in the libsqlite3 Nix already has
   loaded. The library doesn't link libsqlite3 itself, so the same file
