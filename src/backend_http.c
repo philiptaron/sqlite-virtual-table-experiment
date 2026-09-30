@@ -6,6 +6,9 @@
  *                "order": bool, "limit": N|null, "prefetch": N|null}
  *               -> {"rows": [[...], ...], "epoch": E,
  *                   "prefetch": {"paths": [...], "refs": [...], "outputs": [...]}}
+ *   /v1/suspect {"path": P} -> {}
+ *               P may hold files other than the registered ones: the host
+ *               lost its lock on P, and may have acted on it anyway.
  *   /v1/commit  {"id": ID,
  *                "ops": [{"op": "insert", "table": T, "cols": [...]},
  *                        {"op": "update", "table": T, "id": N, "cols": [...]},
@@ -649,6 +652,18 @@ static int http_rollback(nr_backend *base) {
   return SQLITE_OK;
 }
 
+static int http_suspect(nr_backend *base, const char *path) {
+  http_backend *h = (http_backend *)base;
+  sqlite3_str *body = sqlite3_str_new(NULL);
+  sqlite3_str_appendall(body, "{\"path\":");
+  append_json(h, body, NULL, path);
+  sqlite3_str_appendall(body, "}");
+  char *response = NULL;
+  int rc = post(h, "/v1/suspect", sqlite3_str_finish(body), &response);
+  sqlite3_free(response);
+  return rc;
+}
+
 static void http_close(nr_backend *base) {
   http_backend *h = (http_backend *)base;
   if (h->curl)
@@ -674,6 +689,7 @@ static const struct nr_backend_ops http_ops = {
   .begin = http_begin,
   .commit = http_commit,
   .rollback = http_rollback,
+  .suspect = http_suspect,
 };
 
 /* Parse the URL's ?cache_ttl=N&prefetch=N&retry=N into h. */

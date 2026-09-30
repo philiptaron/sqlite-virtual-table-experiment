@@ -83,7 +83,8 @@ case ${1:-} in
       fi
     done < <(sqlite3 "$db" 'select path, hash from ValidPaths')
     [[ $mismatched == 0 ]] || exit 1
-    echo "and each one's contents match the hash the service holds"
+    echo "and each one's contents match the hash the service holds, including these, which hosts reported as suspect:"
+    sqlite3 "$db" 'select path from Suspects order by first' 
     ;;
 
   logs)

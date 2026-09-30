@@ -235,6 +235,15 @@ SQL
   fi
   nixr nix-store --store "$a" --verify-path "$(cat "$work/replayed.out")" &&
     ok "and its path is valid" || not_ok "the replayed commit's path isn't valid"
+
+  echo "# paths a host acted on without its lock"
+  api() { curl -sf -H 'Content-Type: application/json' -d "$2" "$backend/v1/$1"; }
+  api suspect "{\"path\": \"$top\"}" >/dev/null && api suspect "{\"path\": \"$top\"}" >/dev/null
+  listed=$(api suspects '{}')
+  python3 -c 'import json, sys; [s] = json.loads(sys.argv[1])["suspects"]; assert s["path"] == sys.argv[2] and s["reports"] == 2 and s["hash"]' "$listed" "$top" &&
+    ok "a reported path is listed, with its hash" || not_ok "suspects: $listed"
+  [[ $(api suspects "{\"clear\": [\"$top\"]}") == '{"suspects": []}' ]] &&
+    ok "and cleared" || not_ok "clearing a suspect"
 fi
 
 echo "# CA derivations' build trace"

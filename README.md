@@ -322,9 +322,10 @@ Before the watchdog, client1 carried on once it was back, and:
 
 The plugin also checks that its process still holds a path's lock before
 it answers that the path is invalid, and before it registers or changes
-the path (see below). That covers a watchdog that couldn't run: a process
-or a host that was frozen for longer than the lease, or a `lease=` longer
-than the server's. The test checks it from a second state directory on
+the path (see below). That covers what the watchdog can't: a host frozen
+for longer than the lease (see below), a process stopped while its host
+was cut off, or a `lease=` longer than the server's. The test checks it
+from a second state directory on
 client1, made with `nixremote-mkstate --lease 0`, so the watchdog is off:
 
 - **Another host substitutes the output, and hasn't registered it yet.**
@@ -391,10 +392,53 @@ one, plus a READ for each lock file it finds.
 
 The watchdog finds a process's locks in `/proc/self/fdinfo`, which lists
 a descriptor's locks only while they're held. It costs each process that
-holds a lock a `statfs` to the server every two seconds. What it and the
-check leave open is a process or host frozen for longer than the lease
-between the check and the move; a paused VM's clock may not even show
-the pause. Both work only on Linux.
+holds a lock a `statfs` to the server every two seconds. Both work only
+on Linux.
+
+### A host that's frozen
+
+What the watchdog and the check leave open is a host frozen for longer
+than the lease in the moment between the check and the move. A process
+that's merely stopped (SIGSTOP, a debugger, a cgroup freezer) isn't a
+risk: the lease is the host kernel's, which renews it all along, so the
+process keeps its locks, and other hosts only wait. The risk is the
+whole kernel stopping, as when a VM is paused or migrated, or a machine
+suspended:
+
+1. Nix asks whether its output is valid. The plugin's O_DIRECT read of
+   the lock file succeeds, and the answer is that it isn't.
+2. The host freezes before Nix's `deletePath(dest); movePath(chroot, dest)`,
+   microseconds later.
+3. It stays frozen for longer than the lease. nfsd drops its state, and
+   another host takes the lock and substitutes or builds the path.
+4. The host resumes. A paused VM's clock (kvmclock) typically doesn't show
+   the pause, so the watchdog sees no silence and kills nothing.
+5. Nix's REMOVE and RENAME go out on the old NFS session, and get
+   `BADSESSION`. The kernel recovers without telling anyone: it sets up a
+   new client, marks the lock lost, and sends them again. Namespace
+   operations don't depend on locks, so they succeed, and the other
+   host's files are replaced.
+
+A host frozen anywhere else is caught when it resumes: the next check's
+read fails with EIO. Closing the gap needs the moves to depend on
+something the next holder of the lock destroys. Nix could stage each
+output in a directory that every writer of the path deletes once it holds
+the lock, and move both the old files out and its own in relative to
+that directory's handle. A late move by a stale host would then fail
+with ESTALE, which the kernel doesn't retry. That's a change to Nix's
+`registerOutputs` and `addToStore`.
+
+Meanwhile the plugin reports it. After the move, Nix asks again whether
+the path is valid, and then registers it, and the check refuses both. It
+can't tell whether the process has moved anything yet, so whenever the
+check refuses, the plugin reports the path to the service (`/v1/suspect`)
+before failing. The service lists what's been reported, with the hash
+each is registered with (`/v1/suspects`), for someone to verify with
+`nix-store --verify-path` and repair, and forgets a path once told to
+(`{"clear": [...]}`). In the test, the two cut-off subtests without the
+watchdog report their paths; both hold the other host's files and verify,
+and `test/ci-host.sh verify` lists them. A report is best effort: a host
+that can't reach the service fails without it.
 
 ### Either server restarting
 
@@ -460,10 +504,10 @@ test/ci-host.sh verify
 - Registering paths still costs a few round trips per path, mostly Nix
   asking whether each path is valid yet. Those answers can't be cached.
 - The service stores its tables in SQLite, not Postgres, in one process.
-- A Nix process or host frozen for longer than the NFS lease, between the
-  lock check and moving its output in, could still overwrite another
-  host's files (see "How a host tells it lost its lock"). Closing that
-  needs the NFS server to turn away a client whose state it has dropped.
+- A host frozen for longer than the NFS lease, between the lock check and
+  moving its output in, could still overwrite another host's files. The
+  plugin reports the path for someone to verify, but can't prevent it
+  (see "A host that's frozen").
 - Nothing cleans up what a crashed or killed host leaves on the export:
   a chroot, or files it never registered. They go only when some host
   builds or adds the same path again, and a chroot whose output is valid

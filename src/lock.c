@@ -17,8 +17,11 @@
  *   can give its locks away, much as if the host had crashed, and it
  *   can't carry on once the network comes back.
  *
- * - The check (nr_lock_lost), for when the watchdog couldn't run: a
- *   process or host that was frozen, or a lease set wrongly. Once Linux's
+ * - The check (nr_lock_lost), for when the watchdog couldn't help: a host
+ *   whose kernel was frozen (a paused VM, say), which stops renewing the
+ *   lease and may not see the time pass, or a lease set wrongly. A process
+ *   that's merely stopped keeps its locks, since the kernel renews the
+ *   lease all along, unless its host is cut off too. Once Linux's
  *   NFS client has marked a lock lost (recover_lost_locks is off), reads
  *   and writes under it fail with EIO. A lock file is empty, so only a
  *   read with O_DIRECT reaches the server (see test/lockprobe.py). The
