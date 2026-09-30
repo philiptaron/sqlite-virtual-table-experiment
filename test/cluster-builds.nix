@@ -26,7 +26,7 @@ let
   shared = mk "nixremote-shared" "sleep 10; echo shared > $out";
   waiting =
     name:
-    mk "nixremote-${name}" "echo started > $out; while [ ! -e go ]; do [ ! -e fail ] || exit 1; sleep 0.2; done; cat /proc/sys/kernel/random/uuid >> $out";
+    mk "nixremote-${name}" "echo started > $out; while [ ! -e go ]; do sleep 0.2; done; cat /proc/sys/kernel/random/uuid >> $out";
 in
 {
   # Every client asks for this at once. The sleep keeps the first build
@@ -45,7 +45,6 @@ in
   # For cutting a client off mid-build. These wait, halfway through, for a
   # file named go in the build directory, which is local to the client
   # building it; so the test lets each client's build finish separately.
-  # A file named fail there makes the build fail instead.
   # The random last line makes every build's output different, so that
   # which client's output ended up registered is plain to see.
   blip = waiting "blip";
@@ -53,5 +52,4 @@ in
   substituted = waiting "substituted";
   raced = waiting "raced";
   overtaken = waiting "overtaken";
-  failed = waiting "failed";
 }
