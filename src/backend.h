@@ -128,9 +128,16 @@ sqlite3_int64 nr_path_id(const char *path);
 
 /*
  * Whether this process held a lock on path's lock file (path + ".lock") on
- * NFS, and the NFS client has since found it lost (src/lock.c). Always 0
- * off Linux.
+ * NFS, and the NFS client has since found it lost, or the watchdog finds
+ * the server silent for too long (src/lock.c). Always 0 off Linux.
  */
 int nr_lock_lost(const char *path);
+
+/*
+ * Kill this process if it holds a lock on NFS and the server hasn't
+ * answered for two thirds of lease_seconds, the server's lease
+ * (src/lock.c). Once per process; 0 turns it off. Does nothing off Linux.
+ */
+void nr_watchdog_start(int lease_seconds);
 
 #endif

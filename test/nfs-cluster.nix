@@ -99,6 +99,10 @@ in
     import time
 
     store = "${store}"
+    # client1 also has a state directory whose watchdog is off, for the
+    # subtests of what happens without it.
+    guarded = "/var/lib/nixremote"
+    unguarded = "/var/lib/nixremote-unguarded"
     busybox = "${pkgs.busybox}"
     dropped = "${dropped}"
     applied = "${applied}"
@@ -122,13 +126,14 @@ in
         assert rc == "0", f"{m.name}: nix-build exited {rc}:\n{err}"
         return m.succeed(f"cat /tmp/{round}.out").split(), err
 
-    def let_build_finish(m, round, state="/var/lib/nixremote"):
+    def let_build_finish(m, round, state=guarded, trigger="go"):
         """Once m is running a build that waits for go (see
-        cluster-builds.nix), let it carry on; then wait for the round to
-        end, and return its exit code and stderr."""
+        cluster-builds.nix), let it carry on, or with trigger="fail", fail;
+        then wait for the round to end, and return its exit code and
+        stderr."""
         builds = f"{state}/builds/nix-*/build"
         m.wait_until_succeeds(f"test -e /tmp/{round}.rc || ls -d {builds}", timeout=900)
-        m.execute(f"for d in {builds}; do touch $d/go; done")
+        m.execute(f"for d in {builds}; do touch $d/{trigger}; done")
         return outcome(m, round)
 
     def report(m, round, rc, err):
@@ -152,12 +157,28 @@ in
     def reconnect(m):
         m.succeed("iptables -w -D OUTPUT -d ${host} -j DROP && iptables -w -D INPUT -s ${host} -j DROP")
 
-    def cut_off_mid_build(m, name):
+    def cut_off_mid_build(m, name, state=guarded):
         """Have m build name (see cluster-builds.nix), and cut it off once
-        its output is half written."""
-        m.succeed(f"systemd-run --unit={name} --collect /run/current-system/sw/bin/cluster-build {name} -A {name}")
+        its output is half written. Return when it was cut off."""
+        m.succeed(
+            f"systemd-run --unit={name} --collect '--setenv=STORE=local?root=/shared&state={state}' "
+            f"/run/current-system/sw/bin/cluster-build {name} -A {name}"
+        )
         m.wait_until_succeeds(f"grep -qx started /shared/nix/store/*-nixremote-{name}.drv.chroot/root/nix/store/*-nixremote-{name}", timeout=120)
         cut_off(m)
+        return time.monotonic()
+
+    def killed(m, round, since, state=guarded):
+        """Wait for the watchdog to kill m's nix-build while m is cut off,
+        and clear away what it left on m's own disk: its build directory,
+        and its builder if that outlived it."""
+        rc, err = outcome(m, round)
+        report(m, round, rc, err)
+        print(f"{m.name}'s nix-build was killed {time.monotonic() - since:.0f}s after it was cut off")
+        assert rc == "137" and "no answer from the NFS server" in err, f"the watchdog should have killed {m.name}'s nix-build, not let it exit {rc}"
+        survivors = m.execute("pgrep -af '[s]leep 0.2'")[1].strip()
+        print(f"{m.name}'s builder {'outlived it: ' + survivors if survivors else 'died with it'}")
+        m.execute(f"pkill -f '[s]leep 0.2'; rm -rf {state}/builds/nix-*")
 
     def fill_cache(name):
         """Build name in a store of client3's own, and copy it to the binary
@@ -230,6 +251,7 @@ in
             watermark = m.succeed("cat /sys/module/nfsv4/parameters/delegation_watermark").strip()
             assert watermark == "0", f"{m.name} has delegation_watermark={watermark}, want 0"
             m.succeed("nixremote-mkstate /var/lib/nixremote ${backend}")
+        client1.succeed("nixremote-mkstate --lease 0 /var/lib/nixremote-unguarded ${backend}")
 
     with subtest("a path one client copies in is valid on every client"):
         client1.succeed(f"nix copy --no-check-sigs --to '{store}' {busybox}")
@@ -336,67 +358,89 @@ in
     # A client cut off from the host rather than crashed. Its mount is hard,
     # so whatever touches NFS waits, but its builder waits on a local file
     # and carries on. Once nfsd's lease runs out, another client takes the
-    # output lock. Then client1 comes back, and each builder finishes in
-    # turn. Nix never learns that client1 lost the lock.
+    # output lock. Nix never learns that client1 lost the lock, but the
+    # plugin's watchdog kills a Nix process that holds a lock on NFS once
+    # it has heard nothing from the server for two thirds of the lease.
+
+    with subtest("a client cut off for less than the watchdog's deadline carries on"):
+        cut_off_mid_build(client1, "blip")
+        time.sleep(20)
+        reconnect(client1)
+        rc, err = let_build_finish(client1, "blip")
+        report(client1, "blip", rc, err)
+        assert rc == "0", f"client1's build of nixremote-blip should have survived a 20s cut-off, not exited {rc}"
 
     with subtest("a client cut off mid-build, while another builds the same derivation"):
-        cut_off_mid_build(client1, "cutoff")
-        start = time.monotonic()
+        since = cut_off_mid_build(client1, "cutoff")
         client2.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
+        killed(client1, "cutoff", since)
         # client2's build directory appears once it has the output lock, and
-        # its builder runs once it has made its chroot. Reconnecting client1
-        # before then would have it delete the chroot while client2 is still
-        # setting it up.
+        # its builder runs once it has made its chroot, deleting client1's.
         client2.wait_until_succeeds("ls -d /var/lib/nixremote/builds/nix-*/build", timeout=300)
-        client2.wait_until_succeeds("pgrep -f 'do sleep 0.2'", timeout=60)
-        print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - start:.0f}s")
+        client2.wait_until_succeeds("pgrep -f 'd[o] .* sleep 0.2'", timeout=60)
+        print(f"with client1 cut off, client2 started building nixremote-cutoff after {time.monotonic() - since:.0f}s")
+        # client1's nix-build is gone, so it can't delete client2's chroot.
         reconnect(client1)
-        # client2 deleted client1's chroot to make its own, so client1's
-        # builder fails. Cleaning up, client1 deletes the chroot by its
-        # path, which is client2's now, so client2's builder fails too.
-        for m in (client1, client2):
-            rc, err = let_build_finish(m, "cutoff")
-            report(m, "cutoff", rc, err)
-            assert rc != "0" and "Stale file handle" in err, f"{m.name}'s build of nixremote-cutoff should have lost its chroot"
-        client3.succeed("systemd-run --unit=cutoff --collect /run/current-system/sw/bin/cluster-build cutoff -A cutoff")
-        rc, err = let_build_finish(client3, "cutoff")
-        report(client3, "cutoff", rc, err)
-        assert rc == "0", "client3 couldn't build nixremote-cutoff after client1 and client2"
-        [cutoff] = client3.succeed("cat /tmp/cutoff.out").split()
+        rc, err = let_build_finish(client2, "cutoff")
+        report(client2, "cutoff", rc, err)
+        assert rc == "0", f"client2's build of nixremote-cutoff should have succeeded, not exited {rc}"
+        [cutoff] = client2.succeed("cat /tmp/cutoff.out").split()
         for m in clients:
             m.succeed(f"nix-store --store '{store}' --verify-path {cutoff}")
 
     with subtest("a client cut off mid-build, while another substitutes its output"):
         substituted, cached = fill_cache("substituted")
-        cut_off_mid_build(client1, "substituted")
-        start = time.monotonic()
+        since = cut_off_mid_build(client1, "substituted")
         substitute(client2, "substituted")
+        killed(client1, "substituted", since)
         rc, err = outcome(client2, "substituted")
         report(client2, "substituted", rc, err)
-        print(f"with client1 cut off, client2 substituted nixremote-substituted after {time.monotonic() - start:.0f}s")
+        print(f"with client1 cut off, client2 substituted nixremote-substituted after {time.monotonic() - since:.0f}s")
         assert rc == "0" and built(err) == [], "client2 should have substituted nixremote-substituted, not built it"
         reconnect(client1)
-        # client1's chroot is intact, so its build finishes. Registering
-        # its output, Nix finds the path valid, which it expects only of
-        # CA derivations, and aborts on assert(newInfo.ca). Otherwise it
-        # would have moved its own output over the one client2 substituted.
-        rc, err = let_build_finish(client1, "substituted")
-        report(client1, "substituted", rc, err)
-        assert rc == "134", f"client1's nix-build should have aborted, not exited {rc}"
         for m in clients:
             got = m.succeed(f"cat /shared{substituted}")
             assert got == cached, f"{m.name} reads {got!r} from {substituted}, not the cache's {cached!r}"
             m.succeed(f"nix-store --store '{store}' --verify-path {substituted}")
-        # Aborting, client1 left its chroot behind, and nothing else will
-        # delete it: the path is valid, so no one builds it again.
+        # Killed, client1 left its chroot behind, as a crashed client would,
+        # and nothing else will delete it: the path is valid, so no one
+        # builds it again.
         client3.succeed("rm -r /shared/nix/store/*-nixremote-substituted.drv.chroot")
 
-    with subtest("a client cut off mid-build, while another substitutes its output but has yet to register it"):
-        # As above, except that the service holds client2's commit. client1
-        # comes back and finishes while client2's files are in place but
-        # not yet registered.
+    # The rest of these are without the watchdog, from client1's other state
+    # directory: what the plugin's check that it holds the lock catches, and
+    # what it doesn't.
+
+    with subtest("without the watchdog, a client cut off mid-build whose build then fails moves its output over another's"):
+        failed, cached = fill_cache("failed")
+        cut_off_mid_build(client1, "failed", unguarded)
+        start = time.monotonic()
+        substitute(client2, "failed")
+        rc, err = outcome(client2, "failed")
+        report(client2, "failed", rc, err)
+        print(f"with client1 cut off, client2 substituted nixremote-failed after {time.monotonic() - start:.0f}s")
+        assert rc == "0", f"client2 should have substituted nixremote-failed, not exited {rc}"
+        reconnect(client1)
+        # Cleaning up after a failed build, Nix moves the output out of the
+        # chroot to its store path, for debugging, without asking whether
+        # the path is valid. So the plugin never gets to check.
+        rc, err = let_build_finish(client1, "failed", unguarded, trigger="fail")
+        report(client1, "failed", rc, err)
+        assert rc != "0", f"client1's build of nixremote-failed should have failed, not exited {rc}"
+        got = client3.succeed(f"cat /shared{failed}")
+        print(f"after client1's build failed, {failed} holds {got!r}; the cache's is {cached!r}")
+        assert got == "started\n", f"client1 should have moved its half-built output over client2's, but {failed} holds {got!r}"
+        client3.fail(f"nix-store --store '{store}' --verify-path {failed}")
+        client3.succeed(f"nix-store --store '{store}&require-sigs=false' --repair-path {failed} --option substituters file:///cache")
+        for m in clients:
+            m.succeed(f"nix-store --store '{store}' --verify-path {failed}")
+
+    with subtest("without the watchdog, a client cut off mid-build, while another substitutes its output but has yet to register it"):
+        # As above, except that the service holds client2's commit, and
+        # client1's build succeeds. client1 comes back and finishes while
+        # client2's files are in place but not yet registered.
         raced, cached = fill_cache("raced")
-        cut_off_mid_build(client1, "raced")
+        cut_off_mid_build(client1, "raced", unguarded)
         # Only the next commit to register raced waits, which is client2's.
         hook("hold-commits", json.dumps({"path": raced, "count": 1}))
         start = time.monotonic()
@@ -410,7 +454,7 @@ in
         # decide whether to delete what's there and move its own output in.
         # The plugin finds that client1 has lost its lock on raced, and
         # fails the query instead (src/lock.c).
-        rc, err = let_build_finish(client1, "raced")
+        rc, err = let_build_finish(client1, "raced", unguarded)
         report(client1, "raced", rc, err)
         assert rc != "0" and "lost its lock on" in err, f"client1's build of nixremote-raced should have been stopped, not exited {rc}"
         got = client3.succeed(f"cat /shared{raced}")
@@ -425,12 +469,12 @@ in
             assert got == cached, f"{m.name} reads {got!r} from {raced}, not the cache's {cached!r}"
             m.succeed(f"nix-store --store '{store}' --verify-path {raced}")
 
-    with subtest("a client cut off mid-build, whose check that its output is invalid is overtaken by another's commit"):
+    with subtest("without the watchdog, a client cut off mid-build, whose check that its output is invalid is overtaken by another's commit"):
         # As above, except that client2's commit lands after client1 has
         # found the path invalid, and before it moves its output in: the
         # service holds its answer to client1.
         overtaken, cached = fill_cache("overtaken")
-        cut_off_mid_build(client1, "overtaken")
+        cut_off_mid_build(client1, "overtaken", unguarded)
         hook("hold-commits", json.dumps({"path": overtaken, "count": 1}))
         start = time.monotonic()
         substitute(client2, "overtaken")
@@ -441,7 +485,7 @@ in
         # output in (derivation-builder.cc).
         hook("hold-queries", json.dumps({"path": overtaken, "count": 1}))
         reconnect(client1)
-        client1.succeed("for d in /var/lib/nixremote/builds/nix-*/build; do touch $d/go; done")
+        client1.succeed(f"for d in {unguarded}/builds/nix-*/build; do touch $d/go; done")
         client3.wait_until_succeeds("curl -sf -d '{}' ${backend}/v1/test/stats | grep -q '\"held_queries\": 1'", timeout=120)
         released = hook("release-commits")
         assert released == {"released": 1}, f"released {released}, want client2's one commit"
@@ -508,7 +552,7 @@ in
         client3.succeed(f"rm {lock}")
 
     with subtest("in the end, every client agrees on the store's contents"):
-        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {raced} {overtaken}"
+        paths = f"{combined} {interrupted} {dropped} {applied} {cutoff} {substituted} {failed} {raced} {overtaken}"
         closures = {m.name: m.succeed(f"nix path-info --store '{store}' --json --json-format 1 {paths}") for m in clients}
         assert len(set(closures.values())) == 1, f"clients disagree in the end: {closures}"
         for m in clients:
